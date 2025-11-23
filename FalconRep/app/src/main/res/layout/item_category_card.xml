@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.cardview.widget.CardView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="120dp"
+    android:layout_margin="8dp"
+    android:clickable="true"
+    android:focusable="true"
+    android:foreground="?attr/selectableItemBackground"
+    app:cardCornerRadius="12dp"
+    app:cardElevation="2dp">
+
+    <!-- FIX: Removed clickable=true here so the click passes to the CardView -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:gravity="center"
+        android:orientation="vertical">
+
+        <!-- Placeholder Icon -->
+        <ImageView
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:src="@android:drawable/ic_menu_sort_by_size"
+            app:tint="#2196F3"
+            android:layout_marginBottom="8dp"/>
+
+        <TextView
+            android:id="@+id/txtCatName"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Category Name"
+            android:textStyle="bold"
+            android:textSize="16sp"
+            android:textColor="#333333"/>
+
+        <TextView
+            android:id="@+id/txtCatCount"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="12 Products"
+            android:textSize="12sp"
+            android:textColor="#999999"/>
+
+    </LinearLayout>
+</androidx.cardview.widget.CardView>
