@@ -17,7 +17,8 @@ import java.util.List;
 public class DatabaseHelper extends SQLiteOpenHelper {
 
     private static final String DATABASE_NAME = "WooStore.db";
-    private static final int DATABASE_VERSION = 10;
+    // FIX: Bump to 19. This is higher than 18, so it will trigger an upgrade (clean reset).
+    private static final int DATABASE_VERSION = 19;
 
     private static final String TABLE_PRODUCTS = "products";
     private static final String TABLE_VARIATIONS = "variations";
@@ -33,6 +34,8 @@ public class DatabaseHelper extends SQLiteOpenHelper {
     private static final String COL_WEB_URLS = "web_image_urls";
     private static final String COL_TYPE = "product_type";
     private static final String COL_CAT_TOKENS = "cat_tokens";
+    private static final String COL_DISPLAY_PRICE = "display_price";
+    private static final String COL_NEEDS_IMG_SYNC = "needs_img_sync";
 
     // Variation Cols
     private static final String COL_VAR_ID = "var_id";
@@ -41,6 +44,7 @@ public class DatabaseHelper extends SQLiteOpenHelper {
     private static final String COL_VAR_ATTR = "attributes";
     private static final String COL_VAR_IMG_WEB = "web_image";
     private static final String COL_VAR_IMG_LOCAL = "local_image";
+    private static final String COL_VAR_NEEDS_IMG_SYNC = "var_needs_img_sync";
 
     // Category Cols
     private static final String COL_CAT_ID = "cat_id";
@@ -63,7 +67,9 @@ public class DatabaseHelper extends SQLiteOpenHelper {
                 COL_SKU + ", " +
                 COL_WEB_URLS + ", " +
                 COL_TYPE + ", " +
-                COL_CAT_TOKENS +
+                COL_CAT_TOKENS + ", " +
+                COL_DISPLAY_PRICE + ", " +
+                COL_NEEDS_IMG_SYNC +
                 ")";
         db.execSQL(createProducts);
 
@@ -73,7 +79,8 @@ public class DatabaseHelper extends SQLiteOpenHelper {
                 COL_VAR_PRICE + " TEXT, " +
                 COL_VAR_ATTR + " TEXT, " +
                 COL_VAR_IMG_WEB + " TEXT, " +
-                COL_VAR_IMG_LOCAL + " TEXT" +
+                COL_VAR_IMG_LOCAL + " TEXT, " +
+                COL_VAR_NEEDS_IMG_SYNC + " INTEGER" +
                 ")";
         db.execSQL(createVariations);
 
@@ -88,15 +95,106 @@ public class DatabaseHelper extends SQLiteOpenHelper {
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        if (oldVersion < 10) {
-            db.execSQL("DROP TABLE IF EXISTS " + TABLE_PRODUCTS);
-            db.execSQL("DROP TABLE IF EXISTS " + TABLE_VARIATIONS);
-            db.execSQL("DROP TABLE IF EXISTS " + TABLE_CATEGORIES);
-            onCreate(db);
-        }
+        // Drop older tables if they exist
+        db.execSQL("DROP TABLE IF EXISTS " + TABLE_PRODUCTS);
+        db.execSQL("DROP TABLE IF EXISTS " + TABLE_VARIATIONS);
+        db.execSQL("DROP TABLE IF EXISTS " + TABLE_CATEGORIES);
+        // Recreate tables
+        onCreate(db);
     }
 
-    // --- CATEGORIES ---
+    // FIX: Handle downgrades gracefully by resetting the DB instead of crashing
+    @Override
+    public void onDowngrade(SQLiteDatabase db, int oldVersion, int newVersion) {
+        onUpgrade(db, oldVersion, newVersion);
+    }
+
+    // --- PRODUCTS ---
+    public void upsertProduct(Product p) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put("docid", p.getId());
+        values.put(COL_NAME, p.getName());
+        values.put(COL_PRICE, p.getPrice());
+        values.put(COL_WHOLESALE_PRICE, p.getWholesalePrice());
+        values.put(COL_DESC, p.getDescription());
+        values.put(COL_SKU, p.getSku() != null ? p.getSku() : "");
+        values.put(COL_LOCAL_PATHS, p.getLocalPathsString());
+        values.put(COL_WEB_URLS, p.getWebUrlsString());
+        values.put(COL_TYPE, p.getType());
+        values.put(COL_CAT_TOKENS, p.getCategoryTokens());
+
+        if (p.getDisplayPrice() != null) {
+            values.put(COL_DISPLAY_PRICE, p.getDisplayPrice());
+        } else {
+            values.put(COL_DISPLAY_PRICE, p.getWholesalePrice());
+        }
+
+        values.put(COL_NEEDS_IMG_SYNC, "1");
+
+        db.replace(TABLE_PRODUCTS, null, values);
+    }
+
+    public List<Product> getProductsNeedingImageSync() {
+        List<Product> list = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS + " WHERE " + COL_NEEDS_IMG_SYNC + "='1'", null);
+        if (cursor.moveToFirst()) {
+            do { list.add(cursorToProduct(cursor)); } while (cursor.moveToNext());
+        }
+        cursor.close();
+        return list;
+    }
+
+    public void markProductImageSynced(int id) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(COL_NEEDS_IMG_SYNC, "0");
+        db.update(TABLE_PRODUCTS, values, "docid=?", new String[]{String.valueOf(id)});
+    }
+
+    // --- VARIATIONS ---
+    public void upsertVariation(Variation v) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(COL_VAR_ID, v.getId());
+        values.put(COL_PARENT_ID, v.getParentId());
+        values.put(COL_VAR_PRICE, v.getPrice());
+        values.put(COL_VAR_ATTR, v.getAttributesString());
+        values.put(COL_VAR_IMG_WEB, v.getWebImageUrl());
+        values.put(COL_VAR_IMG_LOCAL, v.getLocalImagePath());
+        values.put(COL_VAR_NEEDS_IMG_SYNC, 1);
+
+        db.replace(TABLE_VARIATIONS, null, values);
+    }
+
+    public List<Variation> getVariationsNeedingImageSync() {
+        List<Variation> list = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.rawQuery("SELECT * FROM " + TABLE_VARIATIONS + " WHERE " + COL_VAR_NEEDS_IMG_SYNC + "=1", null);
+        if (cursor.moveToFirst()) {
+            do {
+                int id = cursor.getInt(cursor.getColumnIndexOrThrow(COL_VAR_ID));
+                int parentId = cursor.getInt(cursor.getColumnIndexOrThrow(COL_PARENT_ID));
+                String price = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_PRICE));
+                String attrs = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_ATTR));
+                String webUrl = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_WEB));
+                String localPath = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_LOCAL));
+                list.add(new Variation(id, parentId, price, attrs, localPath, webUrl));
+            } while (cursor.moveToNext());
+        }
+        cursor.close();
+        return list;
+    }
+
+    public void markVariationImageSynced(int id) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(COL_VAR_NEEDS_IMG_SYNC, 0);
+        db.update(TABLE_VARIATIONS, values, COL_VAR_ID + "=?", new String[]{String.valueOf(id)});
+    }
+
+    // --- CATEGORIES & HELPERS ---
     public void upsertCategory(Category c) {
         SQLiteDatabase db = this.getWritableDatabase();
         ContentValues values = new ContentValues();
@@ -124,109 +222,35 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         return list;
     }
 
-    // --- PRODUCTS ---
-    public void upsertProduct(Product p) {
+    public void updateProductDisplayPrice(int productId, String priceRange) {
         SQLiteDatabase db = this.getWritableDatabase();
         ContentValues values = new ContentValues();
-        values.put("docid", p.getId());
-        values.put(COL_NAME, p.getName());
-        values.put(COL_PRICE, p.getPrice());
-        values.put(COL_WHOLESALE_PRICE, p.getWholesalePrice());
-        values.put(COL_DESC, p.getDescription());
-        values.put(COL_SKU, p.getSku() != null ? p.getSku() : "");
-        values.put(COL_LOCAL_PATHS, p.getLocalPathsString());
-        values.put(COL_WEB_URLS, p.getWebUrlsString());
-        values.put(COL_TYPE, p.getType());
-        values.put(COL_CAT_TOKENS, p.getCategoryTokens());
-
-        db.replace(TABLE_PRODUCTS, null, values);
+        values.put(COL_DISPLAY_PRICE, priceRange);
+        values.put(COL_NEEDS_IMG_SYNC, "1");
+        db.update(TABLE_PRODUCTS, values, "docid=?", new String[]{String.valueOf(productId)});
     }
 
     public List<Product> searchProducts(String keyword, int categoryId) {
         List<Product> list = new ArrayList<>();
         SQLiteDatabase db = this.getReadableDatabase();
         Cursor cursor;
-
         String searchText = (keyword == null) ? "" : keyword.trim();
         StringBuilder matchQuery = new StringBuilder();
-
-        // 1. Append Keyword if present
-        if (!searchText.isEmpty()) {
-            matchQuery.append(searchText).append("*");
-        }
-
-        // 2. Append Category Token if present
+        if (!searchText.isEmpty()) matchQuery.append(searchText).append("*");
         if (categoryId > 0) {
             if (matchQuery.length() > 0) matchQuery.append(" ");
             matchQuery.append("cat_").append(categoryId);
         }
-
-        // 3. Execute Query
-        if (matchQuery.length() == 0) {
-            // Return All (No filter)
-            cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS, null);
-        } else {
-            // FTS Match
-            cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS + " WHERE " + TABLE_PRODUCTS + " MATCH ?", new String[]{matchQuery.toString()});
-        }
-
-        if (cursor.moveToFirst()) {
-            do {
-                list.add(cursorToProduct(cursor));
-            } while (cursor.moveToNext());
-        }
+        if (matchQuery.length() == 0) cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS, null);
+        else cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS + " WHERE " + TABLE_PRODUCTS + " MATCH ?", new String[]{matchQuery.toString()});
+        if (cursor.moveToFirst()) do { list.add(cursorToProduct(cursor)); } while (cursor.moveToNext());
         cursor.close();
         return list;
     }
 
-    // --- VARIATIONS & HELPERS ---
-    public void upsertVariation(Variation v) {
-        SQLiteDatabase db = this.getWritableDatabase();
-        ContentValues values = new ContentValues();
-        values.put(COL_VAR_ID, v.getId());
-        values.put(COL_PARENT_ID, v.getParentId());
-        values.put(COL_VAR_PRICE, v.getPrice());
-        values.put(COL_VAR_ATTR, v.getAttributesString());
-        values.put(COL_VAR_IMG_WEB, v.getWebImageUrl());
-        values.put(COL_VAR_IMG_LOCAL, v.getLocalImagePath());
-        db.replace(TABLE_VARIATIONS, null, values);
-    }
-
-    public List<Variation> getVariationsForProduct(int parentId) {
-        List<Variation> list = new ArrayList<>();
-        SQLiteDatabase db = this.getReadableDatabase();
-        Cursor cursor = db.rawQuery("SELECT * FROM " + TABLE_VARIATIONS + " WHERE " + COL_PARENT_ID + "=?", new String[]{String.valueOf(parentId)});
-        if (cursor.moveToFirst()) {
-            do {
-                int id = cursor.getInt(cursor.getColumnIndexOrThrow(COL_VAR_ID));
-                String price = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_PRICE));
-                String attrs = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_ATTR));
-                String webUrl = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_WEB));
-                String localPath = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_LOCAL));
-                list.add(new Variation(id, parentId, price, attrs, localPath, webUrl));
-            } while (cursor.moveToNext());
-        }
-        cursor.close();
-        return list;
-    }
-
+    // Compatibility methods
     public List<Variation> getAllVariations() {
-        List<Variation> list = new ArrayList<>();
-        SQLiteDatabase db = this.getReadableDatabase();
-        Cursor cursor = db.rawQuery("SELECT * FROM " + TABLE_VARIATIONS, null);
-        if (cursor.moveToFirst()) {
-            do {
-                int id = cursor.getInt(cursor.getColumnIndexOrThrow(COL_VAR_ID));
-                int parentId = cursor.getInt(cursor.getColumnIndexOrThrow(COL_PARENT_ID));
-                String price = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_PRICE));
-                String attrs = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_ATTR));
-                String webUrl = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_WEB));
-                String localPath = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_LOCAL));
-                list.add(new Variation(id, parentId, price, attrs, localPath, webUrl));
-            } while (cursor.moveToNext());
-        }
-        cursor.close();
-        return list;
+        return getVariationsNeedingImageSync();
     }
 
     public Product getProductById(int id) {
@@ -242,9 +266,7 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         List<Integer> ids = new ArrayList<>();
         SQLiteDatabase db = this.getReadableDatabase();
         Cursor cursor = db.rawQuery("SELECT docid FROM " + TABLE_PRODUCTS, null);
-        if (cursor.moveToFirst()) {
-            do { ids.add(cursor.getInt(0)); } while (cursor.moveToNext());
-        }
+        if (cursor.moveToFirst()) { do { ids.add(cursor.getInt(0)); } while (cursor.moveToNext()); }
         cursor.close();
         return ids;
     }
@@ -268,8 +290,8 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         String webUrls = cursor.getString(cursor.getColumnIndexOrThrow(COL_WEB_URLS));
         String type = cursor.getString(cursor.getColumnIndexOrThrow(COL_TYPE));
         String catTokens = cursor.getString(cursor.getColumnIndexOrThrow(COL_CAT_TOKENS));
-
-        return new Product(id, name, sku, price, desc, type, localPaths, wholesale, webUrls, catTokens);
+        String displayPrice = cursor.getString(cursor.getColumnIndexOrThrow(COL_DISPLAY_PRICE));
+        return new Product(id, name, sku, price, desc, type, localPaths, wholesale, webUrls, catTokens, displayPrice);
     }
 
     public int getProductCount() {
@@ -288,5 +310,23 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         if (cursor.moveToFirst()) count = cursor.getInt(0);
         cursor.close();
         return count;
+    }
+
+    public List<Variation> getVariationsForProduct(int parentId) {
+        List<Variation> list = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.rawQuery("SELECT * FROM " + TABLE_VARIATIONS + " WHERE " + COL_PARENT_ID + "=?", new String[]{String.valueOf(parentId)});
+        if (cursor.moveToFirst()) {
+            do {
+                int id = cursor.getInt(cursor.getColumnIndexOrThrow(COL_VAR_ID));
+                String price = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_PRICE));
+                String attrs = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_ATTR));
+                String webUrl = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_WEB));
+                String localPath = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_LOCAL));
+                list.add(new Variation(id, parentId, price, attrs, localPath, webUrl));
+            } while (cursor.moveToNext());
+        }
+        cursor.close();
+        return list;
     }
 }

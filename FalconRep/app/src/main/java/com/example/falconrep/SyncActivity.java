@@ -37,15 +37,12 @@ public class SyncActivity extends AppCompatActivity {
         txtStatus.setText("Checking Internet...");
 
         if (isOnline()) {
-            // 1. If Online -> Start Sync
             startSync();
         } else {
-            // 2. If Offline -> Check if we can just go to Home
             DatabaseHelper db = new DatabaseHelper(this);
             if (db.getProductCount() > 0) {
                 finishSync("Offline Mode: Data Available");
             } else {
-                // 3. If Offline AND Empty -> Stay here
                 txtStatus.setText("No Internet & No Local Data");
                 progressBar.setIndeterminate(false);
                 progressBar.setProgress(0);
@@ -67,18 +64,24 @@ public class SyncActivity extends AppCompatActivity {
     private void startSync() {
         txtStatus.setText("Starting Sync...");
 
-        OneTimeWorkRequest syncRequest = new OneTimeWorkRequest.Builder(SyncWorker.class)
-                .addTag("falcon_sync")
+        // 1. Create Sync Worker (Data)
+        OneTimeWorkRequest syncDataRequest = new OneTimeWorkRequest.Builder(SyncWorker.class)
+                .addTag("falcon_sync_data")
                 .build();
 
-        // Always REPLACE existing work to ensure a fresh sync on app start or button click
-        WorkManager.getInstance(this).enqueueUniqueWork(
-                "falcon_manual_sync",
-                ExistingWorkPolicy.REPLACE,
-                syncRequest
-        );
+        // 2. Create Image Worker (Background Media)
+        OneTimeWorkRequest syncImagesRequest = new OneTimeWorkRequest.Builder(ImageWorker.class)
+                .addTag("falcon_sync_images")
+                .build();
 
-        WorkManager.getInstance(this).getWorkInfoByIdLiveData(syncRequest.getId())
+        // 3. Chain: Data -> Then Images
+        WorkManager.getInstance(this)
+                .beginUniqueWork("falcon_full_sync", ExistingWorkPolicy.REPLACE, syncDataRequest)
+                .then(syncImagesRequest)
+                .enqueue();
+
+        // 4. Observe ONLY the Data Sync (The first one)
+        WorkManager.getInstance(this).getWorkInfoByIdLiveData(syncDataRequest.getId())
                 .observe(this, workInfo -> {
                     if (workInfo != null) {
                         Data progress = workInfo.getProgress();
@@ -90,7 +93,9 @@ public class SyncActivity extends AppCompatActivity {
                         txtProgress.setText(percent + "%");
 
                         if (workInfo.getState() == WorkInfo.State.SUCCEEDED) {
-                            finishSync("Sync Complete!");
+                            // FIX: Navigate to Home immediately after Data Sync!
+                            // Image Sync will continue running in the background.
+                            finishSync("Data Sync Complete! Downloading images in background...");
                         } else if (workInfo.getState() == WorkInfo.State.FAILED) {
                             String error = workInfo.getOutputData().getString("error");
                             finishSync("Sync Failed: " + error);
@@ -98,19 +103,17 @@ public class SyncActivity extends AppCompatActivity {
                     }
                 });
 
-        // Allow skipping sync if it gets stuck
         btnCancel.setOnClickListener(v -> {
-            WorkManager.getInstance(this).cancelWorkById(syncRequest.getId());
+            WorkManager.getInstance(this).cancelAllWork();
             finishSync("Sync Cancelled");
         });
     }
 
     private void finishSync(String message) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
-        // FIX: Always navigate to HomeActivity after sync
         Intent intent = new Intent(SyncActivity.this, HomeActivity.class);
         intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP | Intent.FLAG_ACTIVITY_NEW_TASK);
         startActivity(intent);
-        finish(); // Close SyncActivity so Back button works correctly in Home
+        finish();
     }
 }

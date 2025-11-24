@@ -13,17 +13,15 @@ import com.example.falconrep.models.Category;
 import com.example.falconrep.models.Product;
 import com.example.falconrep.models.Variation;
 
-import java.io.File;
-import java.io.FileOutputStream;
 import java.io.IOException;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
+import java.text.ParseException;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
+import java.util.TimeZone;
 import java.util.concurrent.TimeUnit;
 
 import okhttp3.OkHttpClient;
@@ -38,24 +36,32 @@ public class SyncWorker extends Worker {
 
     private static final String BASE_URL = "https://falconstationery.com/wp-json/wc/v3/";
     private static final String TAG = "FalconSync";
-    private static final int CONNECTION_TIMEOUT_MS = 45000;
 
     private final DatabaseHelper dbHelper;
     private final SharedPreferences prefs;
     private final WooCommerceAPI api;
+
+    // Format for WooCommerce (UTC)
+    private final SimpleDateFormat iso8601Format;
+
+    private String newSyncTime;
 
     public SyncWorker(@NonNull Context context, @NonNull WorkerParameters workerParams) {
         super(context, workerParams);
         dbHelper = new DatabaseHelper(context);
         prefs = context.getSharedPreferences("FalconStorePrefs", Context.MODE_PRIVATE);
 
+        // FIX: Use UTC Timezone for all dates to match Server Time
+        iso8601Format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
+        iso8601Format.setTimeZone(TimeZone.getTimeZone("UTC"));
+
         HttpLoggingInterceptor logging = new HttpLoggingInterceptor();
         logging.setLevel(HttpLoggingInterceptor.Level.BASIC);
 
         OkHttpClient client = new OkHttpClient.Builder()
-                .connectTimeout(CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                .readTimeout(CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                .writeTimeout(CONNECTION_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                .connectTimeout(45, TimeUnit.SECONDS)
+                .readTimeout(45, TimeUnit.SECONDS)
+                .writeTimeout(45, TimeUnit.SECONDS)
                 .addInterceptor(logging)
                 .addInterceptor(chain -> {
                     Request original = chain.request();
@@ -81,24 +87,23 @@ public class SyncWorker extends Worker {
     public Result doWork() {
         try {
             Log.d(TAG, "Sync Started...");
-            updateProgress("Starting Sync...", 0);
+            updateProgress("Checking for updates...", 0);
 
-            // 1. Fetch Categories (Fast)
+            // 1. Capture Current Time (UTC) BEFORE Fetching
+            newSyncTime = iso8601Format.format(new Date());
+
+            // 2. Prepare "After" Parameter (Safely)
+            String lastSyncParam = getSafeLastSyncTime();
+
+            // 3. Execute Sync
             fetchCategories();
-
-            // 2. Fetch Text Data
-            fetchNewAndModifiedProducts();
-
-            // 3. Cleanup
+            fetchNewAndModifiedProducts(lastSyncParam);
             performZombieCleanup();
 
-            // 4. Download Images
-            downloadAllImagesDetailed();
+            // 4. Save New Time ONLY if successful
+            prefs.edit().putString("LAST_SYNC_DATE", newSyncTime).apply();
 
-            String currentTime = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault()).format(new Date());
-            prefs.edit().putString("LAST_SYNC_DATE", currentTime).apply();
-
-            updateProgress("Sync Complete", 100);
+            updateProgress("Data Sync Complete", 100);
             return Result.success();
         } catch (Exception e) {
             Log.e(TAG, "Sync Crashed", e);
@@ -106,29 +111,49 @@ public class SyncWorker extends Worker {
         }
     }
 
+    private String getSafeLastSyncTime() {
+        // FIX: If DB is empty (fresh install or version upgrade), force FULL SYNC
+        if (dbHelper.getProductCount() == 0) {
+            Log.d(TAG, "DB Empty: Forcing Full Sync");
+            return null;
+        }
+
+        String storedTime = prefs.getString("LAST_SYNC_DATE", null);
+        if (storedTime == null) return null;
+
+        try {
+            // FIX: Subtract 10 Minutes buffer to handle clock skew or slow server updates
+            Date date = iso8601Format.parse(storedTime);
+            if (date != null) {
+                long bufferedTime = date.getTime() - (10 * 60 * 1000); // -10 Minutes
+                return iso8601Format.format(new Date(bufferedTime));
+            }
+        } catch (ParseException e) {
+            Log.e(TAG, "Date parse error, forcing full sync");
+        }
+        return null;
+    }
+
     private void fetchCategories() throws IOException {
-        updateProgress("Fetching Categories...", 5);
+        updateProgress("Fetching Categories...", 10);
         Response<List<Category>> response = api.fetchCategories(
                 BuildConfig.WC_KEY, BuildConfig.WC_SECRET, 100, true).execute();
-
         if (response.isSuccessful() && response.body() != null) {
-            for (Category c : response.body()) {
-                dbHelper.upsertCategory(c);
-            }
+            for (Category c : response.body()) dbHelper.upsertCategory(c);
         }
     }
 
-    private void fetchNewAndModifiedProducts() throws IOException {
-        String lastSync = prefs.getString("LAST_SYNC_DATE", null);
+    private void fetchNewAndModifiedProducts(String afterDate) throws IOException {
         int page = 1;
         boolean hasMore = true;
 
         while (hasMore) {
-            updateProgress("Fetching text data (Page " + page + ")...", 10);
+            updateProgress("Downloading Products (Page " + page + ")...", 30);
+            Log.d(TAG, "Fetching products after: " + afterDate + " | Page: " + page);
 
             Response<List<Product>> response = api.fetchWooCommerceProducts(
                     BuildConfig.WC_KEY, BuildConfig.WC_SECRET,
-                    50, page, "publish", lastSync).execute();
+                    50, page, "publish", afterDate).execute();
 
             if (response.isSuccessful() && response.body() != null) {
                 List<Product> batch = response.body();
@@ -136,6 +161,7 @@ public class SyncWorker extends Worker {
                     hasMore = false;
                 } else {
                     for (Product p : batch) {
+                        // Upsert flags product as dirty (needs_img_sync = 1)
                         dbHelper.upsertProduct(p);
                         if ("variable".equalsIgnoreCase(p.getType())) {
                             fetchVariationsForProduct(p.getId());
@@ -144,6 +170,7 @@ public class SyncWorker extends Worker {
                     page++;
                 }
             } else {
+                Log.e(TAG, "API Error: " + response.code());
                 hasMore = false;
             }
         }
@@ -154,15 +181,30 @@ public class SyncWorker extends Worker {
                 productId, BuildConfig.WC_KEY, BuildConfig.WC_SECRET, 100).execute();
 
         if (response.isSuccessful() && response.body() != null) {
+            List<Double> prices = new ArrayList<>();
+
             for (Variation v : response.body()) {
                 v.setParentId(productId);
                 dbHelper.upsertVariation(v);
+                try {
+                    String pStr = v.getPrice().replace(",", "").trim();
+                    if (!pStr.isEmpty()) prices.add(Double.parseDouble(pStr));
+                } catch (NumberFormatException e) {}
+            }
+
+            if (!prices.isEmpty()) {
+                double min = Collections.min(prices);
+                double max = Collections.max(prices);
+                String range = (Math.abs(max - min) < 0.01)
+                        ? String.format(Locale.US, "%.2f", min)
+                        : String.format(Locale.US, "%.2f - %.2f", min, max);
+                dbHelper.updateProductDisplayPrice(productId, range);
             }
         }
     }
 
     private void performZombieCleanup() throws IOException {
-        updateProgress("Cleaning database...", 30);
+        updateProgress("Finalizing...", 90);
         List<Integer> serverIds = new ArrayList<>();
         int page = 1;
         boolean hasMore = true;
@@ -174,123 +216,18 @@ public class SyncWorker extends Worker {
 
             if (response.isSuccessful() && response.body() != null) {
                 List<Product> batch = response.body();
-                if (batch.isEmpty()) {
-                    hasMore = false;
-                } else {
-                    for (Product p : batch) serverIds.add(p.getId());
-                    page++;
-                }
-            } else {
-                hasMore = false;
-            }
+                if (batch.isEmpty()) hasMore = false;
+                else { for (Product p : batch) serverIds.add(p.getId()); page++; }
+            } else hasMore = false;
         }
 
         if (serverIds.isEmpty()) return;
-
         List<Integer> localIds = dbHelper.getAllLocalProductIds();
         List<Integer> toDelete = new ArrayList<>();
         for (Integer localId : localIds) {
             if (!serverIds.contains(localId)) toDelete.add(localId);
         }
         if (!toDelete.isEmpty()) dbHelper.deleteProducts(toDelete);
-    }
-
-    private void downloadAllImagesDetailed() {
-        List<Product> allProducts = dbHelper.searchProducts("", 0); // 0 = All Categories
-        List<Variation> allVariations = dbHelper.getAllVariations();
-
-        int totalItems = allProducts.size() + allVariations.size();
-        int processedCount = 0;
-
-        // 1. Product Images
-        for (Product p : allProducts) {
-            if (isStopped()) break;
-            processedCount++;
-            if (processedCount % 2 == 0) {
-                int progress = 35 + (int) (((float) processedCount / totalItems) * 65);
-                updateProgress("Checking Product " + processedCount + "/" + totalItems, progress);
-            }
-
-            List<String> webUrls = p.getWebUrls();
-            if (webUrls.isEmpty()) continue;
-
-            List<String> localPaths = new ArrayList<>();
-            List<String> existingPaths = p.getLocalPaths();
-            boolean changed = false;
-
-            for (int i = 0; i < webUrls.size(); i++) {
-                String url = webUrls.get(i);
-                String fileName = "img_" + p.getId() + "_" + i + ".jpg";
-
-                if (existingPaths.size() > i) {
-                    String oldPath = existingPaths.get(i);
-                    if (oldPath != null && new File(oldPath).exists()) {
-                        localPaths.add(oldPath);
-                        continue;
-                    }
-                }
-
-                String savedPath = downloadFile(url, fileName);
-                if (!savedPath.isEmpty()) {
-                    localPaths.add(savedPath);
-                    changed = true;
-                }
-            }
-
-            if (changed || localPaths.size() != existingPaths.size()) {
-                p.setLocalPaths(localPaths);
-                dbHelper.upsertProduct(p);
-            }
-        }
-
-        // 2. Variation Images
-        for (Variation v : allVariations) {
-            if (isStopped()) break;
-            processedCount++;
-            if (processedCount % 2 == 0) {
-                int progress = 35 + (int) (((float) processedCount / totalItems) * 65);
-                updateProgress("Checking Variation " + processedCount + "/" + totalItems, progress);
-            }
-
-            String url = v.getWebImageUrl();
-            if (url == null || url.isEmpty()) continue;
-
-            String currentLocal = v.getLocalImagePath();
-            if (currentLocal != null && new File(currentLocal).exists()) continue;
-
-            String fileName = "var_" + v.getParentId() + "_" + v.getId() + ".jpg";
-            String savedPath = downloadFile(url, fileName);
-
-            if (!savedPath.isEmpty()) {
-                v.setLocalImagePath(savedPath);
-                dbHelper.upsertVariation(v);
-            }
-        }
-    }
-
-    private String downloadFile(String urlStr, String fileName) {
-        try {
-            URL url = new URL(urlStr);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(CONNECTION_TIMEOUT_MS);
-            conn.setReadTimeout(CONNECTION_TIMEOUT_MS);
-            conn.connect();
-
-            if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) return "";
-
-            File file = new File(getApplicationContext().getFilesDir(), fileName);
-            InputStream in = conn.getInputStream();
-            FileOutputStream out = new FileOutputStream(file);
-
-            byte[] buf = new byte[4096];
-            int len;
-            while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
-            out.close();
-            in.close();
-            return file.getAbsolutePath();
-        } catch (Exception e) {
-            return "";
-        }
     }
 
     private void updateProgress(String status, int percent) {

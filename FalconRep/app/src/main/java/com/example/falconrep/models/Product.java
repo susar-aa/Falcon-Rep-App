@@ -12,6 +12,7 @@ public class Product {
     private String price;
     private String description;
     private String type;
+    private String date_modified_gmt; // NEW FIELD: Critical for Sync Logic
     private List<Image> images;
     private List<MetaData> meta_data;
     private List<CategoryStub> categories;
@@ -19,17 +20,18 @@ public class Product {
     private List<String> localPaths;
     private List<String> webUrls;
     private String localWholesalePrice;
-
     private String categoryTokens;
+    private String displayPrice;
 
     // --- API CONSTRUCTOR ---
-    public Product(int id, String name, String sku, String price, String description, String type, List<Image> images, List<MetaData> meta_data, List<CategoryStub> categories) {
+    public Product(int id, String name, String sku, String price, String description, String type, String date_modified_gmt, List<Image> images, List<MetaData> meta_data, List<CategoryStub> categories) {
         this.id = id;
         this.name = name;
         this.sku = sku;
         this.price = price;
         this.description = description;
         this.type = type;
+        this.date_modified_gmt = date_modified_gmt;
         this.images = images;
         this.meta_data = meta_data;
         this.categories = categories;
@@ -43,7 +45,7 @@ public class Product {
     }
 
     // --- DB CONSTRUCTOR ---
-    public Product(int id, String name, String sku, String price, String description, String type, String localPathsStr, String localWholesalePrice, String webUrlsStr, String categoryTokens) {
+    public Product(int id, String name, String sku, String price, String description, String type, String localPathsStr, String localWholesalePrice, String webUrlsStr, String categoryTokens, String displayPrice) {
         this.id = id;
         this.name = name;
         this.sku = sku;
@@ -52,6 +54,7 @@ public class Product {
         this.type = type;
         this.localWholesalePrice = localWholesalePrice;
         this.categoryTokens = categoryTokens;
+        this.displayPrice = displayPrice;
 
         this.localPaths = new ArrayList<>();
         if (localPathsStr != null && !localPathsStr.isEmpty()) {
@@ -67,21 +70,18 @@ public class Product {
     public int getId() { return id; }
     public String getName() { return name; }
     public String getSku() { return sku; }
-    public String getPrice() { return price; }
+    public String getPrice() { return cleanPrice(price); }
     public String getDescription() { return description; }
     public String getType() { return type; }
+    public String getDisplayPrice() { return displayPrice; }
+    public String getDateModifiedGmt() { return date_modified_gmt; }
 
-    // FIX: Append Category Names to the search token string
-    // Now FTS can search for "Arts" and find products in that category
     public String getCategoryTokens() {
         if (categoryTokens != null) return categoryTokens;
-
         if (categories == null || categories.isEmpty()) return "";
         StringBuilder sb = new StringBuilder();
         for (CategoryStub c : categories) {
-            // Token for filtering
             sb.append("cat_").append(c.id).append(" ");
-            // Name for searching (e.g. "Arts", "Crafts")
             if (c.name != null) sb.append(c.name).append(" ");
         }
         return sb.toString().trim();
@@ -120,25 +120,53 @@ public class Product {
         return null;
     }
 
+    // --- B2B PRICE LOGIC ---
     public String getWholesalePrice() {
+        if (displayPrice != null && !displayPrice.isEmpty()) return displayPrice;
         if (localWholesalePrice != null && !localWholesalePrice.isEmpty()) return localWholesalePrice;
-        if (meta_data != null) {
-            for (MetaData meta : meta_data) {
-                if (meta.key == null) continue;
-                String k = meta.key.toLowerCase();
-                String val = String.valueOf(meta.value);
-                if (val == null || val.isEmpty() || val.equals("0")) continue;
-                if (k.contains("wholesalex") && k.contains("price")) return val;
+
+        if (meta_data == null) return cleanPrice(price);
+
+        // PASS 1: Search specifically for B2B keys (High Priority)
+        for (MetaData meta : meta_data) {
+            if (meta.key == null) continue;
+            String k = meta.key.toLowerCase();
+            String val = String.valueOf(meta.value);
+            if (!isValidPrice(val)) continue;
+
+            if (k.contains("b2b") && k.contains("price")) {
+                return cleanPrice(val);
             }
         }
-        return price;
+
+        // PASS 2: Search for generic wholesale keys
+        for (MetaData meta : meta_data) {
+            if (meta.key == null) continue;
+            String k = meta.key.toLowerCase();
+            String val = String.valueOf(meta.value);
+            if (!isValidPrice(val)) continue;
+
+            if (k.contains("regular")) continue;
+
+            if (k.contains("wholesalex") && k.contains("price")) {
+                return cleanPrice(val);
+            }
+        }
+
+        return cleanPrice(price);
+    }
+
+    private boolean isValidPrice(String val) {
+        if (val == null || val.isEmpty() || val.equals("0")) return false;
+        return val.matches("[0-9.,\\- ]+");
+    }
+
+    private String cleanPrice(String raw) {
+        if (raw == null) return "";
+        return raw.replaceAll("<[^>]*>", "").trim();
     }
 
     public void setLocalWholesalePrice(String price) { this.localWholesalePrice = price; }
-
-    public String getDebugMetaKeys() {
-        return "SKU: " + sku + "\nCats: " + getCategoryTokens();
-    }
 
     public static class Image { String src; }
     public static class MetaData { String key; Object value; }
