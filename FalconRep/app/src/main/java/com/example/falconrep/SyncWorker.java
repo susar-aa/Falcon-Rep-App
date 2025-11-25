@@ -2,6 +2,8 @@ package com.example.falconrep;
 
 import android.content.Context;
 import android.content.SharedPreferences;
+import android.database.sqlite.SQLiteDatabase;
+import android.text.TextUtils;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -30,7 +32,6 @@ import okhttp3.logging.HttpLoggingInterceptor;
 import retrofit2.Response;
 import retrofit2.Retrofit;
 import retrofit2.converter.gson.GsonConverterFactory;
-import com.example.falconrep.BuildConfig;
 
 public class SyncWorker extends Worker {
 
@@ -41,9 +42,7 @@ public class SyncWorker extends Worker {
     private final SharedPreferences prefs;
     private final WooCommerceAPI api;
 
-    // Format for WooCommerce (UTC)
     private final SimpleDateFormat iso8601Format;
-
     private String newSyncTime;
 
     public SyncWorker(@NonNull Context context, @NonNull WorkerParameters workerParams) {
@@ -51,7 +50,6 @@ public class SyncWorker extends Worker {
         dbHelper = new DatabaseHelper(context);
         prefs = context.getSharedPreferences("FalconStorePrefs", Context.MODE_PRIVATE);
 
-        // FIX: Use UTC Timezone for all dates to match Server Time
         iso8601Format = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US);
         iso8601Format.setTimeZone(TimeZone.getTimeZone("UTC"));
 
@@ -66,7 +64,7 @@ public class SyncWorker extends Worker {
                 .addInterceptor(chain -> {
                     Request original = chain.request();
                     Request request = original.newBuilder()
-                            .header("User-Agent", "Mozilla/5.0 (Android 14; Mobile; rv:120.0) Gecko/120.0 Firefox/120.0")
+                            .header("User-Agent", "FalconRep/1.0")
                             .method(original.method(), original.body())
                             .build();
                     return chain.proceed(request);
@@ -89,18 +87,18 @@ public class SyncWorker extends Worker {
             Log.d(TAG, "Sync Started...");
             updateProgress("Checking for updates...", 0);
 
-            // 1. Capture Current Time (UTC) BEFORE Fetching
             newSyncTime = iso8601Format.format(new Date());
+            Date cutoffDate = getSafeLastSyncDate();
 
-            // 2. Prepare "After" Parameter (Safely)
-            String lastSyncParam = getSafeLastSyncTime();
-
-            // 3. Execute Sync
+            // 1. Fetch Categories (Now with proper pagination)
             fetchCategories();
-            fetchNewAndModifiedProducts(lastSyncParam);
+
+            // 2. Fetch Products
+            fetchNewAndModifiedProducts(cutoffDate);
+
+            // 3. Cleanup
             performZombieCleanup();
 
-            // 4. Save New Time ONLY if successful
             prefs.edit().putString("LAST_SYNC_DATE", newSyncTime).apply();
 
             updateProgress("Data Sync Complete", 100);
@@ -111,49 +109,87 @@ public class SyncWorker extends Worker {
         }
     }
 
-    private String getSafeLastSyncTime() {
-        // FIX: If DB is empty (fresh install or version upgrade), force FULL SYNC
-        if (dbHelper.getProductCount() == 0) {
-            Log.d(TAG, "DB Empty: Forcing Full Sync");
-            return null;
-        }
-
+    private Date getSafeLastSyncDate() {
+        if (dbHelper.getProductCount() == 0) return null;
         String storedTime = prefs.getString("LAST_SYNC_DATE", null);
         if (storedTime == null) return null;
-
         try {
-            // FIX: Subtract 10 Minutes buffer to handle clock skew or slow server updates
             Date date = iso8601Format.parse(storedTime);
             if (date != null) {
-                long bufferedTime = date.getTime() - (10 * 60 * 1000); // -10 Minutes
-                return iso8601Format.format(new Date(bufferedTime));
+                long bufferedTime = date.getTime() - (10 * 60 * 1000);
+                return new Date(bufferedTime);
             }
         } catch (ParseException e) {
-            Log.e(TAG, "Date parse error, forcing full sync");
+            Log.e(TAG, "Date parse error");
         }
         return null;
     }
 
+    // UPDATED: Loops through all category pages and cleans up deleted ones
     private void fetchCategories() throws IOException {
         updateProgress("Fetching Categories...", 10);
-        Response<List<Category>> response = api.fetchCategories(
-                BuildConfig.WC_KEY, BuildConfig.WC_SECRET, 100, true).execute();
-        if (response.isSuccessful() && response.body() != null) {
-            for (Category c : response.body()) dbHelper.upsertCategory(c);
+
+        int page = 1;
+        boolean hasMore = true;
+        boolean syncFailed = false;
+        List<Integer> serverCategoryIds = new ArrayList<>();
+
+        while (hasMore) {
+            // hide_empty = false: Ensures we update a category even if you just deleted its last product
+            Response<List<Category>> response = api.fetchCategories(
+                    BuildConfig.WC_KEY, BuildConfig.WC_SECRET, 100, page, false).execute();
+
+            if (response.isSuccessful() && response.body() != null) {
+                List<Category> batch = response.body();
+                if (batch.isEmpty()) {
+                    hasMore = false;
+                } else {
+                    for (Category c : batch) {
+                        dbHelper.upsertCategory(c);
+                        serverCategoryIds.add(c.getId());
+                    }
+                    page++;
+                }
+            } else {
+                Log.e(TAG, "Category Sync Error: " + response.code());
+                hasMore = false;
+                syncFailed = true;
+            }
+        }
+
+        // Cleanup: Delete local categories that are no longer on server
+        // Only run if sync was fully successful to prevent accidental wipes on network error
+        if (!syncFailed && !serverCategoryIds.isEmpty()) {
+            List<Category> localCats = dbHelper.getAllCategories();
+            List<Integer> toDelete = new ArrayList<>();
+
+            for (Category c : localCats) {
+                if (!serverCategoryIds.contains(c.getId())) {
+                    toDelete.add(c.getId());
+                }
+            }
+
+            if (!toDelete.isEmpty()) {
+                SQLiteDatabase db = dbHelper.getWritableDatabase();
+                String args = TextUtils.join(", ", toDelete);
+                // Note: 'categories' table and 'cat_id' column names must match DatabaseHelper
+                db.execSQL("DELETE FROM categories WHERE cat_id IN (" + args + ")");
+            }
         }
     }
 
-    private void fetchNewAndModifiedProducts(String afterDate) throws IOException {
+    private void fetchNewAndModifiedProducts(Date cutoffDate) throws IOException {
         int page = 1;
         boolean hasMore = true;
+        boolean stopFetching = false;
+        long cutoffTime = (cutoffDate != null) ? cutoffDate.getTime() : 0;
 
-        while (hasMore) {
-            updateProgress("Downloading Products (Page " + page + ")...", 30);
-            Log.d(TAG, "Fetching products after: " + afterDate + " | Page: " + page);
+        while (hasMore && !stopFetching) {
+            updateProgress("Syncing Products (Page " + page + ")...", 30);
 
             Response<List<Product>> response = api.fetchWooCommerceProducts(
                     BuildConfig.WC_KEY, BuildConfig.WC_SECRET,
-                    50, page, "publish", afterDate).execute();
+                    50, page, "publish", "modified", "desc").execute();
 
             if (response.isSuccessful() && response.body() != null) {
                 List<Product> batch = response.body();
@@ -161,7 +197,15 @@ public class SyncWorker extends Worker {
                     hasMore = false;
                 } else {
                     for (Product p : batch) {
-                        // Upsert flags product as dirty (needs_img_sync = 1)
+                        if (cutoffTime > 0 && p.getDateModifiedGmt() != null) {
+                            try {
+                                Date pDate = iso8601Format.parse(p.getDateModifiedGmt());
+                                if (pDate != null && pDate.getTime() < cutoffTime) {
+                                    stopFetching = true;
+                                    break;
+                                }
+                            } catch (ParseException e) {}
+                        }
                         dbHelper.upsertProduct(p);
                         if ("variable".equalsIgnoreCase(p.getType())) {
                             fetchVariationsForProduct(p.getId());
@@ -182,7 +226,6 @@ public class SyncWorker extends Worker {
 
         if (response.isSuccessful() && response.body() != null) {
             List<Double> prices = new ArrayList<>();
-
             for (Variation v : response.body()) {
                 v.setParentId(productId);
                 dbHelper.upsertVariation(v);
@@ -191,7 +234,6 @@ public class SyncWorker extends Worker {
                     if (!pStr.isEmpty()) prices.add(Double.parseDouble(pStr));
                 } catch (NumberFormatException e) {}
             }
-
             if (!prices.isEmpty()) {
                 double min = Collections.min(prices);
                 double max = Collections.max(prices);
@@ -204,7 +246,10 @@ public class SyncWorker extends Worker {
     }
 
     private void performZombieCleanup() throws IOException {
-        updateProgress("Finalizing...", 90);
+        String storedTime = prefs.getString("LAST_SYNC_DATE", null);
+        if (storedTime != null) return;
+
+        updateProgress("Cleaning up deleted items...", 90);
         List<Integer> serverIds = new ArrayList<>();
         int page = 1;
         boolean hasMore = true;

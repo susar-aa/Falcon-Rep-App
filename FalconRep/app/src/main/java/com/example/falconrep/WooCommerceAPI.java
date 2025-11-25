@@ -5,12 +5,22 @@ import com.example.falconrep.models.Product;
 import com.example.falconrep.models.Variation;
 
 import java.util.List;
+
 import retrofit2.Call;
 import retrofit2.http.GET;
-import retrofit2.http.Path;
 import retrofit2.http.Query;
 
 public interface WooCommerceAPI {
+
+    // UPDATED: Added 'page' parameter for pagination
+    @GET("products/categories")
+    Call<List<Category>> fetchCategories(
+            @Query("consumer_key") String key,
+            @Query("consumer_secret") String secret,
+            @Query("per_page") int perPage,
+            @Query("page") int page, // Added this
+            @Query("hide_empty") boolean hideEmpty
+    );
 
     @GET("products")
     Call<List<Product>> fetchWooCommerceProducts(
@@ -19,7 +29,16 @@ public interface WooCommerceAPI {
             @Query("per_page") int perPage,
             @Query("page") int page,
             @Query("status") String status,
-            @Query("after") String afterDate
+            @Query("orderby") String orderBy,
+            @Query("order") String order
+    );
+
+    @GET("products/{id}/variations")
+    Call<List<Variation>> fetchProductVariations(
+            @retrofit2.http.Path("id") int productId,
+            @Query("consumer_key") String key,
+            @Query("consumer_secret") String secret,
+            @Query("per_page") int perPage
     );
 
     @GET("products")
@@ -29,23 +48,6 @@ public interface WooCommerceAPI {
             @Query("per_page") int perPage,
             @Query("page") int page,
             @Query("status") String status,
-            @Query("_fields") String fields
-    );
-
-    @GET("products/{id}/variations")
-    Call<List<Variation>> fetchProductVariations(
-            @Path("id") int productId,
-            @Query("consumer_key") String key,
-            @Query("consumer_secret") String secret,
-            @Query("per_page") int perPage
-    );
-
-    // NEW: Fetch Categories
-    @GET("products/categories")
-    Call<List<Category>> fetchCategories(
-            @Query("consumer_key") String key,
-            @Query("consumer_secret") String secret,
-            @Query("per_page") int perPage,
-            @Query("hide_empty") boolean hideEmpty
+            @Query("fields") String fields
     );
 }

@@ -6,6 +6,7 @@ import android.app.NotificationManager;
 import android.content.Context;
 import android.content.pm.ServiceInfo;
 import android.os.Build;
+import android.text.TextUtils;
 import android.util.Log;
 
 import androidx.annotation.NonNull;
@@ -45,32 +46,27 @@ public class ImageWorker extends Worker {
     public Result doWork() {
         Log.d(TAG, "Smart Image Sync Started...");
 
-        // 1. Calculate Total Work
         List<Product> productsToSync = dbHelper.getProductsNeedingImageSync();
         List<Variation> varsToSync = dbHelper.getVariationsNeedingImageSync();
 
         int total = productsToSync.size() + varsToSync.size();
         if (total == 0) return Result.success();
 
-        // 2. Start Foreground Service (Notification)
         setForegroundAsync(createForegroundInfo("Starting Download...", 0, total));
 
         int processed = 0;
 
-        // 3. Sync Products
         for (Product p : productsToSync) {
             if (isStopped()) break;
             processProduct(p);
             dbHelper.markProductImageSynced(p.getId());
 
             processed++;
-            // Update notification every few items to reduce flicker
             if (processed % 2 == 0) {
                 setForegroundAsync(createForegroundInfo("Downloading images (" + processed + "/" + total + ")", processed, total));
             }
         }
 
-        // 4. Sync Variations
         for (Variation v : varsToSync) {
             if (isStopped()) break;
             processVariation(v);
@@ -82,36 +78,7 @@ public class ImageWorker extends Worker {
             }
         }
 
-        Log.d(TAG, "Image Sync Complete.");
         return Result.success();
-    }
-
-    // --- Notification Logic ---
-    private ForegroundInfo createForegroundInfo(String status, int progress, int max) {
-        String title = "Syncing Catalog Images";
-
-        // Create Channel (Required for Android O+)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            NotificationChannel channel = new NotificationChannel(
-                    CHANNEL_ID, "Image Downloads", NotificationManager.IMPORTANCE_LOW);
-            notificationManager.createNotificationChannel(channel);
-        }
-
-        Notification notification = new NotificationCompat.Builder(getApplicationContext(), CHANNEL_ID)
-                .setContentTitle(title)
-                .setTicker(title)
-                .setContentText(status)
-                .setSmallIcon(android.R.drawable.stat_sys_download)
-                .setOngoing(true)
-                .setProgress(max, progress, false)
-                .setPriority(NotificationCompat.PRIORITY_LOW) // Silent notification
-                .build();
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            return new ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
-        } else {
-            return new ForegroundInfo(NOTIFICATION_ID, notification);
-        }
     }
 
     private void processProduct(Product p) {
@@ -126,9 +93,10 @@ public class ImageWorker extends Worker {
             String fileName = "img_" + p.getId() + "_" + i + ".jpg";
             File file = new File(getApplicationContext().getFilesDir(), fileName);
 
-            if (file.exists()) {
+            if (file.exists() && file.length() > 0) {
                 localPaths.add(file.getAbsolutePath());
             } else {
+                if(file.exists()) file.delete(); // Delete 0 byte corrupt files
                 String savedPath = downloadFile(url, fileName);
                 if (!savedPath.isEmpty()) {
                     localPaths.add(savedPath);
@@ -138,8 +106,8 @@ public class ImageWorker extends Worker {
         }
 
         if (changed) {
-            p.setLocalPaths(localPaths);
-            dbHelper.upsertProduct(p);
+            // FIX: Use the specific update method to AVOID triggering the sync flag again
+            dbHelper.updateLocalImagePaths(p.getId(), TextUtils.join("###", localPaths));
         }
     }
 
@@ -150,37 +118,72 @@ public class ImageWorker extends Worker {
         String fileName = "var_" + v.getParentId() + "_" + v.getId() + ".jpg";
         File file = new File(getApplicationContext().getFilesDir(), fileName);
 
-        if (!file.exists()) {
+        if (file.exists() && file.length() > 0) {
+            // Already good
+        } else {
+            if(file.exists()) file.delete();
             String savedPath = downloadFile(url, fileName);
             if (!savedPath.isEmpty()) {
-                v.setLocalImagePath(savedPath);
-                dbHelper.upsertVariation(v);
+                dbHelper.updateVariationImagePath(v.getId(), savedPath);
             }
         }
     }
 
     private String downloadFile(String urlStr, String fileName) {
+        HttpURLConnection conn = null;
+        InputStream in = null;
+        FileOutputStream out = null;
         try {
             URL url = new URL(urlStr);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(30000);
+            conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(15000);
             conn.setReadTimeout(30000);
             conn.connect();
 
             if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) return "";
 
             File file = new File(getApplicationContext().getFilesDir(), fileName);
-            InputStream in = conn.getInputStream();
-            FileOutputStream out = new FileOutputStream(file);
+            in = conn.getInputStream();
+            out = new FileOutputStream(file);
 
-            byte[] buf = new byte[4096];
+            byte[] buf = new byte[8192];
             int len;
-            while ((len = in.read(buf)) > 0) out.write(buf, 0, len);
-            out.close();
-            in.close();
+            while ((len = in.read(buf)) > 0) {
+                if (isStopped()) {
+                    out.close(); in.close(); file.delete(); return "";
+                }
+                out.write(buf, 0, len);
+            }
             return file.getAbsolutePath();
         } catch (Exception e) {
             return "";
+        } finally {
+            try { if (out != null) out.close(); } catch (Exception ignored) {}
+            try { if (in != null) in.close(); } catch (Exception ignored) {}
+            if (conn != null) conn.disconnect();
+        }
+    }
+
+    private ForegroundInfo createForegroundInfo(String status, int progress, int max) {
+        String title = "Syncing Catalog Images";
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                    CHANNEL_ID, "Image Downloads", NotificationManager.IMPORTANCE_LOW);
+            notificationManager.createNotificationChannel(channel);
+        }
+
+        Notification notification = new NotificationCompat.Builder(getApplicationContext(), CHANNEL_ID)
+                .setContentTitle(title)
+                .setContentText(status)
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setOngoing(true)
+                .setProgress(max, progress, false)
+                .build();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return new ForegroundInfo(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC);
+        } else {
+            return new ForegroundInfo(NOTIFICATION_ID, notification);
         }
     }
 }

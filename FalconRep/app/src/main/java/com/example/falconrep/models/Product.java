@@ -12,7 +12,10 @@ public class Product {
     private String price;
     private String description;
     private String type;
-    private String date_modified_gmt; // NEW FIELD: Critical for Sync Logic
+
+    // NEW FIELD: Stores the exact time the product was last edited (in UTC)
+    private String date_modified_gmt;
+
     private List<Image> images;
     private List<MetaData> meta_data;
     private List<CategoryStub> categories;
@@ -74,6 +77,8 @@ public class Product {
     public String getDescription() { return description; }
     public String getType() { return type; }
     public String getDisplayPrice() { return displayPrice; }
+
+    // Getter for the logic
     public String getDateModifiedGmt() { return date_modified_gmt; }
 
     public String getCategoryTokens() {
@@ -127,7 +132,6 @@ public class Product {
 
         if (meta_data == null) return cleanPrice(price);
 
-        // PASS 1: Search specifically for B2B keys (High Priority)
         for (MetaData meta : meta_data) {
             if (meta.key == null) continue;
             String k = meta.key.toLowerCase();
@@ -139,7 +143,6 @@ public class Product {
             }
         }
 
-        // PASS 2: Search for generic wholesale keys
         for (MetaData meta : meta_data) {
             if (meta.key == null) continue;
             String k = meta.key.toLowerCase();

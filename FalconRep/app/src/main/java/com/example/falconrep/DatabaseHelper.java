@@ -10,6 +10,7 @@ import android.text.TextUtils;
 import com.example.falconrep.models.Category;
 import com.example.falconrep.models.Product;
 import com.example.falconrep.models.Variation;
+import com.example.falconrep.utils.SearchUtils; // Make sure to import this
 
 import java.util.ArrayList;
 import java.util.List;
@@ -17,14 +18,15 @@ import java.util.List;
 public class DatabaseHelper extends SQLiteOpenHelper {
 
     private static final String DATABASE_NAME = "WooStore.db";
-    // FIX: Bump to 19. This is higher than 18, so it will trigger an upgrade (clean reset).
-    private static final int DATABASE_VERSION = 19;
+    // BUMPED VERSION: 20 (Triggers onUpgrade to rebuild tables)
+    private static final int DATABASE_VERSION = 20;
 
     private static final String TABLE_PRODUCTS = "products";
     private static final String TABLE_VARIATIONS = "variations";
     private static final String TABLE_CATEGORIES = "categories";
 
     // Product Cols
+    private static final String COL_DOCID = "docid";
     private static final String COL_NAME = "name";
     private static final String COL_PRICE = "price";
     private static final String COL_DESC = "description";
@@ -36,6 +38,9 @@ public class DatabaseHelper extends SQLiteOpenHelper {
     private static final String COL_CAT_TOKENS = "cat_tokens";
     private static final String COL_DISPLAY_PRICE = "display_price";
     private static final String COL_NEEDS_IMG_SYNC = "needs_img_sync";
+
+    // NEW COLUMN: For Fault-Tolerant Search
+    private static final String COL_SEARCH_TOKENS = "search_tokens";
 
     // Variation Cols
     private static final String COL_VAR_ID = "var_id";
@@ -58,6 +63,7 @@ public class DatabaseHelper extends SQLiteOpenHelper {
 
     @Override
     public void onCreate(SQLiteDatabase db) {
+        // FTS4 Table: Now includes search_tokens
         String createProducts = "CREATE VIRTUAL TABLE " + TABLE_PRODUCTS + " USING fts4(" +
                 COL_NAME + ", " +
                 COL_PRICE + ", " +
@@ -69,7 +75,8 @@ public class DatabaseHelper extends SQLiteOpenHelper {
                 COL_TYPE + ", " +
                 COL_CAT_TOKENS + ", " +
                 COL_DISPLAY_PRICE + ", " +
-                COL_NEEDS_IMG_SYNC +
+                COL_NEEDS_IMG_SYNC + ", " +
+                COL_SEARCH_TOKENS + // Added
                 ")";
         db.execSQL(createProducts);
 
@@ -95,25 +102,27 @@ public class DatabaseHelper extends SQLiteOpenHelper {
 
     @Override
     public void onUpgrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        // Drop older tables if they exist
         db.execSQL("DROP TABLE IF EXISTS " + TABLE_PRODUCTS);
         db.execSQL("DROP TABLE IF EXISTS " + TABLE_VARIATIONS);
         db.execSQL("DROP TABLE IF EXISTS " + TABLE_CATEGORIES);
-        // Recreate tables
         onCreate(db);
     }
 
-    // FIX: Handle downgrades gracefully by resetting the DB instead of crashing
     @Override
-    public void onDowngrade(SQLiteDatabase db, int oldVersion, int newVersion) {
-        onUpgrade(db, oldVersion, newVersion);
+    public void onOpen(SQLiteDatabase db) {
+        super.onOpen(db);
+        if (!db.isReadOnly()) {
+            // Enable Write-Ahead Logging for performance
+            db.enableWriteAheadLogging();
+        }
     }
 
     // --- PRODUCTS ---
+
     public void upsertProduct(Product p) {
         SQLiteDatabase db = this.getWritableDatabase();
         ContentValues values = new ContentValues();
-        values.put("docid", p.getId());
+        values.put(COL_DOCID, p.getId());
         values.put(COL_NAME, p.getName());
         values.put(COL_PRICE, p.getPrice());
         values.put(COL_WHOLESALE_PRICE, p.getWholesalePrice());
@@ -130,9 +139,31 @@ public class DatabaseHelper extends SQLiteOpenHelper {
             values.put(COL_DISPLAY_PRICE, p.getWholesalePrice());
         }
 
+        // GENERATE FUZZY TOKENS (Includes SKU + Name Skeleton + Cats)
+        String fuzzyTokens = SearchUtils.generateSearchTokens(
+                p.getName(),
+                p.getSku(),
+                p.getCategoryTokens()
+        );
+        values.put(COL_SEARCH_TOKENS, fuzzyTokens);
+
         values.put(COL_NEEDS_IMG_SYNC, "1");
 
         db.replace(TABLE_PRODUCTS, null, values);
+    }
+
+    public void updateLocalImagePaths(int productId, String serializedPaths) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(COL_LOCAL_PATHS, serializedPaths);
+        db.update(TABLE_PRODUCTS, values, "docid = ?", new String[]{String.valueOf(productId)});
+    }
+
+    public void updateProductDisplayPrice(int productId, String priceRange) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(COL_DISPLAY_PRICE, priceRange);
+        db.update(TABLE_PRODUCTS, values, "docid=?", new String[]{String.valueOf(productId)});
     }
 
     public List<Product> getProductsNeedingImageSync() {
@@ -154,6 +185,7 @@ public class DatabaseHelper extends SQLiteOpenHelper {
     }
 
     // --- VARIATIONS ---
+
     public void upsertVariation(Variation v) {
         SQLiteDatabase db = this.getWritableDatabase();
         ContentValues values = new ContentValues();
@@ -164,8 +196,14 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         values.put(COL_VAR_IMG_WEB, v.getWebImageUrl());
         values.put(COL_VAR_IMG_LOCAL, v.getLocalImagePath());
         values.put(COL_VAR_NEEDS_IMG_SYNC, 1);
-
         db.replace(TABLE_VARIATIONS, null, values);
+    }
+
+    public void updateVariationImagePath(int varId, String path) {
+        SQLiteDatabase db = this.getWritableDatabase();
+        ContentValues values = new ContentValues();
+        values.put(COL_VAR_IMG_LOCAL, path);
+        db.update(TABLE_VARIATIONS, values, COL_VAR_ID + "=?", new String[]{String.valueOf(varId)});
     }
 
     public List<Variation> getVariationsNeedingImageSync() {
@@ -194,7 +232,8 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         db.update(TABLE_VARIATIONS, values, COL_VAR_ID + "=?", new String[]{String.valueOf(id)});
     }
 
-    // --- CATEGORIES & HELPERS ---
+    // --- CATEGORIES ---
+
     public void upsertCategory(Category c) {
         SQLiteDatabase db = this.getWritableDatabase();
         ContentValues values = new ContentValues();
@@ -222,13 +261,7 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         return list;
     }
 
-    public void updateProductDisplayPrice(int productId, String priceRange) {
-        SQLiteDatabase db = this.getWritableDatabase();
-        ContentValues values = new ContentValues();
-        values.put(COL_DISPLAY_PRICE, priceRange);
-        values.put(COL_NEEDS_IMG_SYNC, "1");
-        db.update(TABLE_PRODUCTS, values, "docid=?", new String[]{String.valueOf(productId)});
-    }
+    // --- UPDATED SEARCH & QUERIES ---
 
     public List<Product> searchProducts(String keyword, int categoryId) {
         List<Product> list = new ArrayList<>();
@@ -236,21 +269,31 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         Cursor cursor;
         String searchText = (keyword == null) ? "" : keyword.trim();
         StringBuilder matchQuery = new StringBuilder();
-        if (!searchText.isEmpty()) matchQuery.append(searchText).append("*");
+
+        // Use SearchUtils to normalize ("Pencel" -> "pencel* OR pncl*")
+        String fuzzyQuery = SearchUtils.normalizeQuery(searchText);
+
+        if (!fuzzyQuery.isEmpty()) {
+            // Target the specialized token column
+            matchQuery.append(COL_SEARCH_TOKENS).append(":").append(fuzzyQuery);
+        }
+
         if (categoryId > 0) {
-            if (matchQuery.length() > 0) matchQuery.append(" ");
+            if (matchQuery.length() > 0) matchQuery.append(" AND ");
+            // Cat tokens are also inside search_tokens now, so simpler matching
             matchQuery.append("cat_").append(categoryId);
         }
-        if (matchQuery.length() == 0) cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS, null);
-        else cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS + " WHERE " + TABLE_PRODUCTS + " MATCH ?", new String[]{matchQuery.toString()});
+
+        if (matchQuery.length() == 0) {
+            cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS, null);
+        } else {
+            // Using FTS MATCH with our robust token column
+            cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS + " WHERE " + TABLE_PRODUCTS + " MATCH ?", new String[]{matchQuery.toString()});
+        }
+
         if (cursor.moveToFirst()) do { list.add(cursorToProduct(cursor)); } while (cursor.moveToNext());
         cursor.close();
         return list;
-    }
-
-    // Compatibility methods
-    public List<Variation> getAllVariations() {
-        return getVariationsNeedingImageSync();
     }
 
     public Product getProductById(int id) {
@@ -260,6 +303,42 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         if (cursor.moveToFirst()) p = cursorToProduct(cursor);
         cursor.close();
         return p;
+    }
+
+    public List<Variation> getVariationsForProduct(int parentId) {
+        List<Variation> list = new ArrayList<>();
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.rawQuery("SELECT * FROM " + TABLE_VARIATIONS + " WHERE " + COL_PARENT_ID + "=?", new String[]{String.valueOf(parentId)});
+        if (cursor.moveToFirst()) {
+            do {
+                int id = cursor.getInt(cursor.getColumnIndexOrThrow(COL_VAR_ID));
+                String price = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_PRICE));
+                String attrs = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_ATTR));
+                String webUrl = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_WEB));
+                String localPath = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_LOCAL));
+                list.add(new Variation(id, parentId, price, attrs, localPath, webUrl));
+            } while (cursor.moveToNext());
+        }
+        cursor.close();
+        return list;
+    }
+
+    public int getProductCount() {
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.rawQuery("SELECT COUNT(*) FROM " + TABLE_PRODUCTS, null);
+        int count = 0;
+        if (cursor.moveToFirst()) count = cursor.getInt(0);
+        cursor.close();
+        return count;
+    }
+
+    public int getOfflineReadyCount() {
+        SQLiteDatabase db = this.getReadableDatabase();
+        Cursor cursor = db.rawQuery("SELECT COUNT(*) FROM " + TABLE_PRODUCTS + " WHERE " + COL_LOCAL_PATHS + " IS NOT NULL AND " + COL_LOCAL_PATHS + " != ''", null);
+        int count = 0;
+        if (cursor.moveToFirst()) count = cursor.getInt(0);
+        cursor.close();
+        return count;
     }
 
     public List<Integer> getAllLocalProductIds() {
@@ -292,41 +371,5 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         String catTokens = cursor.getString(cursor.getColumnIndexOrThrow(COL_CAT_TOKENS));
         String displayPrice = cursor.getString(cursor.getColumnIndexOrThrow(COL_DISPLAY_PRICE));
         return new Product(id, name, sku, price, desc, type, localPaths, wholesale, webUrls, catTokens, displayPrice);
-    }
-
-    public int getProductCount() {
-        SQLiteDatabase db = this.getReadableDatabase();
-        Cursor cursor = db.rawQuery("SELECT COUNT(*) FROM " + TABLE_PRODUCTS, null);
-        int count = 0;
-        if (cursor.moveToFirst()) count = cursor.getInt(0);
-        cursor.close();
-        return count;
-    }
-
-    public int getOfflineReadyCount() {
-        SQLiteDatabase db = this.getReadableDatabase();
-        Cursor cursor = db.rawQuery("SELECT COUNT(*) FROM " + TABLE_PRODUCTS + " WHERE " + COL_LOCAL_PATHS + " IS NOT NULL AND " + COL_LOCAL_PATHS + " != ''", null);
-        int count = 0;
-        if (cursor.moveToFirst()) count = cursor.getInt(0);
-        cursor.close();
-        return count;
-    }
-
-    public List<Variation> getVariationsForProduct(int parentId) {
-        List<Variation> list = new ArrayList<>();
-        SQLiteDatabase db = this.getReadableDatabase();
-        Cursor cursor = db.rawQuery("SELECT * FROM " + TABLE_VARIATIONS + " WHERE " + COL_PARENT_ID + "=?", new String[]{String.valueOf(parentId)});
-        if (cursor.moveToFirst()) {
-            do {
-                int id = cursor.getInt(cursor.getColumnIndexOrThrow(COL_VAR_ID));
-                String price = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_PRICE));
-                String attrs = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_ATTR));
-                String webUrl = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_WEB));
-                String localPath = cursor.getString(cursor.getColumnIndexOrThrow(COL_VAR_IMG_LOCAL));
-                list.add(new Variation(id, parentId, price, attrs, localPath, webUrl));
-            } while (cursor.moveToNext());
-        }
-        cursor.close();
-        return list;
     }
 }
