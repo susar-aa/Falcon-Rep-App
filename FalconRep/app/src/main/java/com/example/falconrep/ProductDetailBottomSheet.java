@@ -10,7 +10,6 @@ import android.view.ViewGroup;
 import android.widget.ImageButton;
 import android.widget.ImageView;
 import android.widget.TextView;
-import android.widget.LinearLayout;
 import android.widget.FrameLayout;
 
 import androidx.annotation.NonNull;
@@ -20,6 +19,7 @@ import androidx.recyclerview.widget.RecyclerView;
 import androidx.viewpager2.widget.ViewPager2;
 
 import com.bumptech.glide.Glide;
+// Removed DiskCacheStrategy import as we are using direct local storage
 import com.example.falconrep.models.Product;
 import com.example.falconrep.models.Variation;
 import com.google.android.material.bottomsheet.BottomSheetBehavior;
@@ -35,12 +35,11 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
     private static final String ARG_PRODUCT_ID = "product_id";
 
     private ViewPager2 viewPager;
-    private ImageButton btnMaximizeImage;
-    private TextView txtIndicator, txtName, txtPrice, txtDesc, lblQuickSelect;
+    private ImageButton btnMaximizeImage, btnCloseSheet;
+    private TextView txtIndicator, txtName, txtPrice, txtDesc, lblQuickSelect, lblAllVariants;
     private RecyclerView rvVariations, rvVariationSlider;
     private DatabaseHelper dbHelper;
 
-    // Keep track of gallery paths to find index later
     private List<String> mainGalleryPaths = new ArrayList<>();
 
     public static ProductDetailBottomSheet newInstance(int productId) {
@@ -66,6 +65,7 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
             FrameLayout bottomSheet = d.findViewById(com.google.android.material.R.id.design_bottom_sheet);
             if (bottomSheet != null) {
                 BottomSheetBehavior.from(bottomSheet).setState(BottomSheetBehavior.STATE_EXPANDED);
+                BottomSheetBehavior.from(bottomSheet).setSkipCollapsed(true);
             }
         });
         return dialog;
@@ -74,28 +74,27 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
     @Override
     public void onViewCreated(@NonNull View view, @Nullable Bundle savedInstanceState) {
         super.onViewCreated(view, savedInstanceState);
-
         dbHelper = new DatabaseHelper(requireContext());
 
         viewPager = view.findViewById(R.id.viewPagerGallery);
         btnMaximizeImage = view.findViewById(R.id.btnMaximizeImage);
+        btnCloseSheet = view.findViewById(R.id.btnCloseSheet);
         txtIndicator = view.findViewById(R.id.txtPageIndicator);
         txtName = view.findViewById(R.id.detailName);
         txtPrice = view.findViewById(R.id.detailPrice);
         txtDesc = view.findViewById(R.id.detailDescription);
         rvVariations = view.findViewById(R.id.rvVariations);
-
         rvVariationSlider = view.findViewById(R.id.rvVariationSlider);
         lblQuickSelect = view.findViewById(R.id.lblQuickSelect);
+        lblAllVariants = view.findViewById(R.id.lblAllVariants);
 
-        // Setup Maximize Button Click Listener
+        btnCloseSheet.setOnClickListener(v -> dismiss());
+
         btnMaximizeImage.setOnClickListener(v -> {
             if (!mainGalleryPaths.isEmpty()) {
                 int currentItem = viewPager.getCurrentItem();
                 if (currentItem >= 0 && currentItem < mainGalleryPaths.size()) {
                     String imagePath = mainGalleryPaths.get(currentItem);
-
-                    // Don't open placeholder
                     if (!imagePath.equals("placeholder")) {
                         Intent intent = new Intent(requireContext(), FullScreenImageActivity.class);
                         intent.putExtra(FullScreenImageActivity.EXTRA_IMAGE_PATH, imagePath);
@@ -118,7 +117,6 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
             return;
         }
 
-        // Initial Load: Use Product Name and Price (Decoded)
         txtName.setText(Html.fromHtml(p.getName(), Html.FROM_HTML_MODE_LEGACY));
         txtPrice.setText("Rs " + p.getWholesalePrice());
 
@@ -126,45 +124,71 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
             txtDesc.setText(Html.fromHtml(p.getDescription(), Html.FROM_HTML_MODE_COMPACT));
         }
 
-        // 1. Fetch Variations
         List<Variation> variations = dbHelper.getVariationsForProduct(id);
-
-        // 2. Setup Images (Merge Product + Variation images for full gallery)
         setupImages(p, variations);
-
-        // 3. Setup Variations UI (Pass 'p' to handle name updates)
         setupVariationsUI(variations, p);
     }
 
     private void setupImages(Product p, List<Variation> variations) {
         mainGalleryPaths.clear();
 
-        // A. Add Main Product Images
         List<String> localPaths = p.getLocalPaths();
         List<String> webUrls = p.getWebUrls();
         int count = Math.max(localPaths.size(), webUrls.size());
 
         for (int i = 0; i < count; i++) {
             String path = null;
-            if (i < localPaths.size()) path = localPaths.get(i);
-            if (path == null || path.isEmpty() || !new File(path).exists()) {
-                if (i < webUrls.size()) path = webUrls.get(i);
+
+            // 1. Try DB Path
+            if (i < localPaths.size()) {
+                String potentialPath = localPaths.get(i);
+                if (isValidFile(potentialPath)) {
+                    path = potentialPath;
+                }
             }
+
+            // 2. Try Predictive Local Path (Fallback if DB is outdated but file exists)
+            // Filename format matches ImageWorker: img_{id}_{index}.jpg
+            if (path == null) {
+                String fileName = "img_" + p.getId() + "_" + i + ".jpg";
+                File fallbackFile = new File(requireContext().getFilesDir(), fileName);
+                if (fallbackFile.exists() && fallbackFile.length() > 0) {
+                    path = fallbackFile.getAbsolutePath();
+                }
+            }
+
+            // 3. Fallback to Web URL
+            if (path == null && i < webUrls.size()) {
+                path = webUrls.get(i);
+            }
+
             if (path != null) mainGalleryPaths.add(path);
         }
 
-        // B. Add Variation Images (Unique ones)
+        // Add Variation Images
         if (variations != null) {
             for (Variation v : variations) {
                 String vPath = null;
-                // Prefer local
-                if (v.getLocalImagePath() != null && new File(v.getLocalImagePath()).exists()) {
+
+                // Try DB Path
+                if (isValidFile(v.getLocalImagePath())) {
                     vPath = v.getLocalImagePath();
-                } else {
+                }
+
+                // Try Predictive Path
+                if (vPath == null) {
+                    String fileName = "var_" + v.getParentId() + "_" + v.getId() + ".jpg";
+                    File fallbackFile = new File(requireContext().getFilesDir(), fileName);
+                    if (fallbackFile.exists() && fallbackFile.length() > 0) {
+                        vPath = fallbackFile.getAbsolutePath();
+                    }
+                }
+
+                // Web Fallback
+                if (vPath == null) {
                     vPath = v.getWebImageUrl();
                 }
 
-                // Add if valid and not duplicate (simple string check)
                 if (vPath != null && !vPath.isEmpty() && !mainGalleryPaths.contains(vPath)) {
                     mainGalleryPaths.add(vPath);
                 }
@@ -185,39 +209,54 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
         });
     }
 
+    private boolean isValidFile(String path) {
+        return path != null && !path.isEmpty() && new File(path).exists() && new File(path).length() > 0;
+    }
+
     private void setupVariationsUI(List<Variation> variations, Product p) {
         if (variations == null || variations.isEmpty()) {
             rvVariations.setVisibility(View.GONE);
             rvVariationSlider.setVisibility(View.GONE);
             lblQuickSelect.setVisibility(View.GONE);
+            lblAllVariants.setVisibility(View.GONE);
             return;
         }
 
-        // 1. Vertical List (Existing)
         rvVariations.setVisibility(View.VISIBLE);
         rvVariations.setLayoutManager(new LinearLayoutManager(getContext()));
         rvVariations.setAdapter(new VariationsAdapter(variations));
 
-        // 2. Horizontal Slider (New)
         rvVariationSlider.setVisibility(View.VISIBLE);
         lblQuickSelect.setVisibility(View.VISIBLE);
+        lblAllVariants.setVisibility(View.VISIBLE);
         rvVariationSlider.setLayoutManager(new LinearLayoutManager(getContext(), LinearLayoutManager.HORIZONTAL, false));
 
         VariationSliderAdapter sliderAdapter = new VariationSliderAdapter(variations, variation -> {
-            // ACTION 1: Find image in gallery and scroll to it
-            String targetPath = (variation.getLocalImagePath() != null && new File(variation.getLocalImagePath()).exists())
-                    ? variation.getLocalImagePath()
-                    : variation.getWebImageUrl();
+            String targetPath = null;
+
+            // Check Local DB Path
+            if (isValidFile(variation.getLocalImagePath())) {
+                targetPath = variation.getLocalImagePath();
+            }
+
+            // Check Predictive Path
+            if (targetPath == null) {
+                String fileName = "var_" + variation.getParentId() + "_" + variation.getId() + ".jpg";
+                File fallbackFile = new File(requireContext().getFilesDir(), fileName);
+                if (fallbackFile.exists() && fallbackFile.length() > 0) {
+                    targetPath = fallbackFile.getAbsolutePath();
+                }
+            }
+
+            // Web Fallback
+            if (targetPath == null) targetPath = variation.getWebImageUrl();
 
             if (targetPath != null && mainGalleryPaths.contains(targetPath)) {
                 int index = mainGalleryPaths.indexOf(targetPath);
-                viewPager.setCurrentItem(index, true); // Smooth scroll
+                viewPager.setCurrentItem(index, true);
             }
 
-            // ACTION 2: Update Price
             txtPrice.setText("Rs " + variation.getPrice());
-
-            // ACTION 3: Update Name (Append attributes)
             String baseName = Html.fromHtml(p.getName(), Html.FROM_HTML_MODE_LEGACY).toString();
             String variantInfo = variation.getAttributesString();
             if (variantInfo != null && !variantInfo.isEmpty()) {
@@ -229,9 +268,6 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
         rvVariationSlider.setAdapter(sliderAdapter);
     }
 
-    // --- ADAPTERS ---
-
-    // 1. Main Gallery Adapter
     class GalleryAdapter extends RecyclerView.Adapter<GalleryAdapter.ImgViewHolder> {
         private List<String> paths;
         public GalleryAdapter(List<String> paths) { this.paths = paths; }
@@ -247,8 +283,14 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
                 holder.img.setImageResource(android.R.drawable.ic_menu_gallery);
                 return;
             }
-            if (path.startsWith("http")) Glide.with(holder.itemView).load(path).into(holder.img);
-            else Glide.with(holder.itemView).load(new File(path)).into(holder.img);
+
+            // Robust loading: File object vs URL string
+            if (path.startsWith("/")) { // Local Path usually starts with /data/user...
+                Glide.with(holder.itemView).load(new File(path)).into(holder.img);
+            } else {
+                // HTTP URL - Only load if absolutely necessary
+                Glide.with(holder.itemView).load(path).into(holder.img);
+            }
         }
         @Override public int getItemCount() { return paths.size(); }
         class ImgViewHolder extends RecyclerView.ViewHolder {
@@ -257,34 +299,43 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
         }
     }
 
-    // 2. Variation Slider Adapter (The Horizontal Cards)
     class VariationSliderAdapter extends RecyclerView.Adapter<VariationSliderAdapter.CardViewHolder> {
         private List<Variation> list;
         private OnVariationClickListener listener;
-
         public VariationSliderAdapter(List<Variation> list, OnVariationClickListener listener) {
             this.list = list;
             this.listener = listener;
         }
-
-        @NonNull @Override
-        public CardViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
+        @NonNull @Override public CardViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
             View v = LayoutInflater.from(parent.getContext()).inflate(R.layout.item_variation_card, parent, false);
             return new CardViewHolder(v);
         }
-
-        @Override
-        public void onBindViewHolder(@NonNull CardViewHolder holder, int position) {
+        @Override public void onBindViewHolder(@NonNull CardViewHolder holder, int position) {
             Variation v = list.get(position);
             holder.name.setText(v.getAttributesString());
             holder.price.setText("Rs " + v.getPrice());
 
-            // Load Image
-            String path = v.getLocalImagePath();
-            if (path != null && new File(path).exists()) {
+            String path = null;
+
+            // 1. Try DB
+            if (isValidFile(v.getLocalImagePath())) {
+                path = v.getLocalImagePath();
+            }
+
+            // 2. Try Predictive
+            if (path == null) {
+                String fileName = "var_" + v.getParentId() + "_" + v.getId() + ".jpg";
+                File fallbackFile = new File(requireContext().getFilesDir(), fileName);
+                if (fallbackFile.exists() && fallbackFile.length() > 0) {
+                    path = fallbackFile.getAbsolutePath();
+                }
+            }
+
+            if (path != null) {
                 Glide.with(holder.itemView).load(new File(path)).into(holder.img);
             } else {
-                Glide.with(holder.itemView).load(v.getWebImageUrl())
+                Glide.with(holder.itemView)
+                        .load(v.getWebImageUrl())
                         .placeholder(android.R.drawable.ic_menu_gallery)
                         .into(holder.img);
             }
@@ -293,12 +344,9 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
                 if (listener != null) listener.onClick(v);
             });
         }
-
         @Override public int getItemCount() { return list.size(); }
-
         class CardViewHolder extends RecyclerView.ViewHolder {
-            ImageView img;
-            TextView name, price;
+            ImageView img; TextView name, price;
             public CardViewHolder(@NonNull View itemView) {
                 super(itemView);
                 img = itemView.findViewById(R.id.imgVariation);
@@ -308,26 +356,12 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
         }
     }
 
-    // 3. Simple List Adapter (The Vertical List)
     class VariationsAdapter extends RecyclerView.Adapter<VariationsAdapter.VarViewHolder> {
         private List<Variation> list;
         public VariationsAdapter(List<Variation> list) { this.list = list; }
         @NonNull @Override public VarViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
-            LinearLayout layout = new LinearLayout(parent.getContext());
-            layout.setOrientation(LinearLayout.HORIZONTAL);
-            layout.setPadding(16, 24, 16, 24); // Increased padding for touch
-
-            TextView text = new TextView(parent.getContext());
-            text.setId(android.R.id.text1);
-            text.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-
-            TextView price = new TextView(parent.getContext());
-            price.setId(android.R.id.text2);
-            price.setTextColor(0xFFE91E63);
-
-            layout.addView(text);
-            layout.addView(price);
-            return new VarViewHolder(layout);
+            View v = LayoutInflater.from(parent.getContext()).inflate(R.layout.item_variation_row, parent, false);
+            return new VarViewHolder(v);
         }
         @Override public void onBindViewHolder(@NonNull VarViewHolder holder, int position) {
             Variation v = list.get(position);
@@ -339,13 +373,10 @@ public class ProductDetailBottomSheet extends BottomSheetDialogFragment {
             TextView text, price;
             public VarViewHolder(@NonNull View itemView) {
                 super(itemView);
-                text = itemView.findViewById(android.R.id.text1);
-                price = itemView.findViewById(android.R.id.text2);
+                text = itemView.findViewById(R.id.txtVarAttribute);
+                price = itemView.findViewById(R.id.txtVarPriceRow);
             }
         }
     }
-
-    interface OnVariationClickListener {
-        void onClick(Variation v);
-    }
+    interface OnVariationClickListener { void onClick(Variation v); }
 }

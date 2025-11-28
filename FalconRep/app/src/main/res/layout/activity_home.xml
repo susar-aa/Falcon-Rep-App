@@ -23,7 +23,7 @@
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:letterSpacing="0.1"
-            android:text="FALCON REPS"
+            android:text="FALCON CATALOG"
             android:textColor="#2196F3"
             android:textSize="32sp"
             android:textStyle="bold" />
@@ -33,7 +33,7 @@
             android:layout_height="wrap_content"
             android:layout_marginBottom="48dp"
             android:layout_marginTop="8dp"
-            android:text="Offline Catalog System"
+            android:text="www.falconstationery.com"
             android:textColor="#757575"
             android:textSize="16sp" />
 
@@ -42,7 +42,7 @@
             android:id="@+id/btnOpenCatalog"
             android:layout_width="match_parent"
             android:layout_height="60dp"
-            android:text="OPEN CATALOG"
+            android:text="PRODUCT CATALOG"
             android:textSize="16sp"
             android:textStyle="bold"
             app:backgroundTint="#2196F3"

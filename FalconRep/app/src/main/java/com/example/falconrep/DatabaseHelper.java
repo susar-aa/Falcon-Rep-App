@@ -10,7 +10,7 @@ import android.text.TextUtils;
 import com.example.falconrep.models.Category;
 import com.example.falconrep.models.Product;
 import com.example.falconrep.models.Variation;
-import com.example.falconrep.utils.SearchUtils; // Make sure to import this
+import com.example.falconrep.utils.SearchUtils;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -18,8 +18,8 @@ import java.util.List;
 public class DatabaseHelper extends SQLiteOpenHelper {
 
     private static final String DATABASE_NAME = "WooStore.db";
-    // BUMPED VERSION: 20 (Triggers onUpgrade to rebuild tables)
-    private static final int DATABASE_VERSION = 20;
+    // BUMPED VERSION to 21 to force table recreation with new token format
+    private static final int DATABASE_VERSION = 21;
 
     private static final String TABLE_PRODUCTS = "products";
     private static final String TABLE_VARIATIONS = "variations";
@@ -38,8 +38,6 @@ public class DatabaseHelper extends SQLiteOpenHelper {
     private static final String COL_CAT_TOKENS = "cat_tokens";
     private static final String COL_DISPLAY_PRICE = "display_price";
     private static final String COL_NEEDS_IMG_SYNC = "needs_img_sync";
-
-    // NEW COLUMN: For Fault-Tolerant Search
     private static final String COL_SEARCH_TOKENS = "search_tokens";
 
     // Variation Cols
@@ -63,7 +61,6 @@ public class DatabaseHelper extends SQLiteOpenHelper {
 
     @Override
     public void onCreate(SQLiteDatabase db) {
-        // FTS4 Table: Now includes search_tokens
         String createProducts = "CREATE VIRTUAL TABLE " + TABLE_PRODUCTS + " USING fts4(" +
                 COL_NAME + ", " +
                 COL_PRICE + ", " +
@@ -76,7 +73,7 @@ public class DatabaseHelper extends SQLiteOpenHelper {
                 COL_CAT_TOKENS + ", " +
                 COL_DISPLAY_PRICE + ", " +
                 COL_NEEDS_IMG_SYNC + ", " +
-                COL_SEARCH_TOKENS + // Added
+                COL_SEARCH_TOKENS +
                 ")";
         db.execSQL(createProducts);
 
@@ -111,14 +108,10 @@ public class DatabaseHelper extends SQLiteOpenHelper {
     @Override
     public void onOpen(SQLiteDatabase db) {
         super.onOpen(db);
-        if (!db.isReadOnly()) {
-            // Enable Write-Ahead Logging for performance
-            db.enableWriteAheadLogging();
-        }
+        if (!db.isReadOnly()) db.enableWriteAheadLogging();
     }
 
     // --- PRODUCTS ---
-
     public void upsertProduct(Product p) {
         SQLiteDatabase db = this.getWritableDatabase();
         ContentValues values = new ContentValues();
@@ -128,27 +121,29 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         values.put(COL_WHOLESALE_PRICE, p.getWholesalePrice());
         values.put(COL_DESC, p.getDescription());
         values.put(COL_SKU, p.getSku() != null ? p.getSku() : "");
-        values.put(COL_LOCAL_PATHS, p.getLocalPathsString());
+
+        String pathsToSave = p.getLocalPathsString();
+        if (TextUtils.isEmpty(pathsToSave)) {
+            Cursor cursor = db.rawQuery("SELECT " + COL_LOCAL_PATHS + " FROM " + TABLE_PRODUCTS + " WHERE docid=?", new String[]{String.valueOf(p.getId())});
+            if (cursor.moveToFirst()) {
+                String existing = cursor.getString(0);
+                if (!TextUtils.isEmpty(existing)) {
+                    pathsToSave = existing;
+                }
+            }
+            cursor.close();
+        }
+        values.put(COL_LOCAL_PATHS, pathsToSave);
+
         values.put(COL_WEB_URLS, p.getWebUrlsString());
         values.put(COL_TYPE, p.getType());
         values.put(COL_CAT_TOKENS, p.getCategoryTokens());
+        values.put(COL_DISPLAY_PRICE, p.getDisplayPrice() != null ? p.getDisplayPrice() : p.getWholesalePrice());
 
-        if (p.getDisplayPrice() != null) {
-            values.put(COL_DISPLAY_PRICE, p.getDisplayPrice());
-        } else {
-            values.put(COL_DISPLAY_PRICE, p.getWholesalePrice());
-        }
-
-        // GENERATE FUZZY TOKENS (Includes SKU + Name Skeleton + Cats)
-        String fuzzyTokens = SearchUtils.generateSearchTokens(
-                p.getName(),
-                p.getSku(),
-                p.getCategoryTokens()
-        );
+        String fuzzyTokens = SearchUtils.generateSearchTokens(p.getName(), p.getSku(), p.getCategoryTokens());
         values.put(COL_SEARCH_TOKENS, fuzzyTokens);
 
         values.put(COL_NEEDS_IMG_SYNC, "1");
-
         db.replace(TABLE_PRODUCTS, null, values);
     }
 
@@ -185,7 +180,6 @@ public class DatabaseHelper extends SQLiteOpenHelper {
     }
 
     // --- VARIATIONS ---
-
     public void upsertVariation(Variation v) {
         SQLiteDatabase db = this.getWritableDatabase();
         ContentValues values = new ContentValues();
@@ -194,7 +188,20 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         values.put(COL_VAR_PRICE, v.getPrice());
         values.put(COL_VAR_ATTR, v.getAttributesString());
         values.put(COL_VAR_IMG_WEB, v.getWebImageUrl());
-        values.put(COL_VAR_IMG_LOCAL, v.getLocalImagePath());
+
+        String pathToSave = v.getLocalImagePath();
+        if (TextUtils.isEmpty(pathToSave)) {
+            Cursor cursor = db.rawQuery("SELECT " + COL_VAR_IMG_LOCAL + " FROM " + TABLE_VARIATIONS + " WHERE " + COL_VAR_ID + "=?", new String[]{String.valueOf(v.getId())});
+            if (cursor.moveToFirst()) {
+                String existing = cursor.getString(0);
+                if (!TextUtils.isEmpty(existing)) {
+                    pathToSave = existing;
+                }
+            }
+            cursor.close();
+        }
+        values.put(COL_VAR_IMG_LOCAL, pathToSave);
+
         values.put(COL_VAR_NEEDS_IMG_SYNC, 1);
         db.replace(TABLE_VARIATIONS, null, values);
     }
@@ -233,7 +240,6 @@ public class DatabaseHelper extends SQLiteOpenHelper {
     }
 
     // --- CATEGORIES ---
-
     public void upsertCategory(Category c) {
         SQLiteDatabase db = this.getWritableDatabase();
         ContentValues values = new ContentValues();
@@ -261,38 +267,87 @@ public class DatabaseHelper extends SQLiteOpenHelper {
         return list;
     }
 
-    // --- UPDATED SEARCH & QUERIES ---
-
-    public List<Product> searchProducts(String keyword, int categoryId) {
+    // --- SEARCH (ENHANCED) ---
+    public List<Product> searchProducts(String userQuery, int categoryId) {
         List<Product> list = new ArrayList<>();
         SQLiteDatabase db = this.getReadableDatabase();
-        Cursor cursor;
-        String searchText = (keyword == null) ? "" : keyword.trim();
-        StringBuilder matchQuery = new StringBuilder();
+        Cursor cursor = null;
 
-        // Use SearchUtils to normalize ("Pencel" -> "pencel* OR pncl*")
-        String fuzzyQuery = SearchUtils.normalizeQuery(searchText);
+        try {
+            // 1. Normalize Query
+            String fuzzyQuery = SearchUtils.normalizeQuery(userQuery);
 
-        if (!fuzzyQuery.isEmpty()) {
-            // Target the specialized token column
-            matchQuery.append(COL_SEARCH_TOKENS).append(":").append(fuzzyQuery);
+            // FIX: Replace explicit " AND " with implicit " " to prevent FTS4 literal match issues
+            fuzzyQuery = fuzzyQuery.replace(" AND ", " ");
+
+            StringBuilder matchQuery = new StringBuilder();
+
+            // 2. Build Strict Query (Implicit AND)
+            if (categoryId > 0) {
+                matchQuery.append("category").append(categoryId);
+                if (!fuzzyQuery.isEmpty()) {
+                    matchQuery.append(" "); // Implicit AND
+                }
+            }
+
+            if (!fuzzyQuery.isEmpty()) {
+                matchQuery.append(fuzzyQuery);
+            }
+
+            String orderBy = " ORDER BY " + COL_NAME + " COLLATE NOCASE ASC";
+
+            // 3. Execute Strict Search
+            if (matchQuery.length() > 0) {
+                String sql = "SELECT docid, * FROM " + TABLE_PRODUCTS + " WHERE " + TABLE_PRODUCTS + " MATCH ?" + orderBy;
+                cursor = db.rawQuery(sql, new String[]{matchQuery.toString()});
+
+                if (cursor.moveToFirst()) {
+                    do {
+                        list.add(cursorToProduct(cursor));
+                    } while (cursor.moveToNext());
+                }
+                cursor.close();
+            } else {
+                // Empty query fallback
+                cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS + orderBy + " LIMIT 100", null);
+                if (cursor.moveToFirst()) {
+                    do { list.add(cursorToProduct(cursor)); } while (cursor.moveToNext());
+                }
+                cursor.close();
+                return list;
+            }
+
+            // 4. FALLBACK: Relaxed Search (OR Logic)
+            // If strict search failed to find results, try to find matches for ANY of the words.
+            // Example: User types "Blue Water Bottle" -> Strict fails -> Relaxed finds "Water Bottle"
+            if (list.isEmpty() && !fuzzyQuery.isEmpty() && fuzzyQuery.contains(") (")) {
+
+                String relaxedQuery;
+                if (categoryId > 0) {
+                    // Enforce category strictly, but relax the user terms
+                    // Format: categoryID ((A) OR (B))
+                    String userPartRelaxed = "(" + fuzzyQuery.replace(") (", ") OR (") + ")";
+                    relaxedQuery = "category" + categoryId + " " + userPartRelaxed;
+                } else {
+                    relaxedQuery = fuzzyQuery.replace(") (", ") OR (");
+                }
+
+                String sql = "SELECT docid, * FROM " + TABLE_PRODUCTS + " WHERE " + TABLE_PRODUCTS + " MATCH ?" + orderBy;
+                cursor = db.rawQuery(sql, new String[]{relaxedQuery});
+
+                if (cursor.moveToFirst()) {
+                    do {
+                        list.add(cursorToProduct(cursor));
+                    } while (cursor.moveToNext());
+                }
+                cursor.close();
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            if (cursor != null && !cursor.isClosed()) cursor.close();
         }
 
-        if (categoryId > 0) {
-            if (matchQuery.length() > 0) matchQuery.append(" AND ");
-            // Cat tokens are also inside search_tokens now, so simpler matching
-            matchQuery.append("cat_").append(categoryId);
-        }
-
-        if (matchQuery.length() == 0) {
-            cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS, null);
-        } else {
-            // Using FTS MATCH with our robust token column
-            cursor = db.rawQuery("SELECT docid, * FROM " + TABLE_PRODUCTS + " WHERE " + TABLE_PRODUCTS + " MATCH ?", new String[]{matchQuery.toString()});
-        }
-
-        if (cursor.moveToFirst()) do { list.add(cursorToProduct(cursor)); } while (cursor.moveToNext());
-        cursor.close();
         return list;
     }
 
@@ -334,7 +389,10 @@ public class DatabaseHelper extends SQLiteOpenHelper {
 
     public int getOfflineReadyCount() {
         SQLiteDatabase db = this.getReadableDatabase();
-        Cursor cursor = db.rawQuery("SELECT COUNT(*) FROM " + TABLE_PRODUCTS + " WHERE " + COL_LOCAL_PATHS + " IS NOT NULL AND " + COL_LOCAL_PATHS + " != ''", null);
+        String sql = "SELECT COUNT(*) FROM " + TABLE_PRODUCTS +
+                " WHERE " + COL_LOCAL_PATHS + " IS NOT NULL " +
+                " AND " + COL_LOCAL_PATHS + " != ''";
+        Cursor cursor = db.rawQuery(sql, null);
         int count = 0;
         if (cursor.moveToFirst()) count = cursor.getInt(0);
         cursor.close();

@@ -18,7 +18,7 @@
             android:layout_height="180dp"
             android:scaleType="centerCrop"
             android:background="#EEEEEE"
-            android:src="@android:drawable/ic_menu_gallery" />
+            android:src="@android:drawable/ic_menu_gallery" /><!-- Set Height 300dp For Tablet -->
 
         <LinearLayout
             android:layout_width="match_parent"

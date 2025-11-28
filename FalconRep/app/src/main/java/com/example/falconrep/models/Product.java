@@ -1,6 +1,8 @@
 package com.example.falconrep.models;
 
+import android.content.Context;
 import android.text.TextUtils;
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -12,10 +14,7 @@ public class Product {
     private String price;
     private String description;
     private String type;
-
-    // NEW FIELD: Stores the exact time the product was last edited (in UTC)
     private String date_modified_gmt;
-
     private List<Image> images;
     private List<MetaData> meta_data;
     private List<CategoryStub> categories;
@@ -77,8 +76,6 @@ public class Product {
     public String getDescription() { return description; }
     public String getType() { return type; }
     public String getDisplayPrice() { return displayPrice; }
-
-    // Getter for the logic
     public String getDateModifiedGmt() { return date_modified_gmt; }
 
     public String getCategoryTokens() {
@@ -86,7 +83,9 @@ public class Product {
         if (categories == null || categories.isEmpty()) return "";
         StringBuilder sb = new StringBuilder();
         for (CategoryStub c : categories) {
-            sb.append("cat_").append(c.id).append(" ");
+            // FIX: Changed "cat_" to "category" to prevent FTS tokenizer splitting
+            // "cat_6" into "cat" + "6", which causes false matches with products having numbers in names.
+            sb.append("category").append(c.id).append(" ");
             if (c.name != null) sb.append(c.name).append(" ");
         }
         return sb.toString().trim();
@@ -119,13 +118,25 @@ public class Product {
         return null;
     }
 
+    // NEW HELPER: Checks if the local file ACTUALLY exists and has data
+    public File getValidLocalFile(Context context) {
+        String path = getFirstImageLocalPath();
+        if (path == null) return null;
+
+        File f = new File(path);
+        // Ensure file exists AND is greater than 0 bytes (not corrupt)
+        if (f.exists() && f.length() > 0) {
+            return f;
+        }
+        return null;
+    }
+
     public String getFirstImageWebUrl() {
         List<String> urls = getWebUrls();
         if (!urls.isEmpty()) return urls.get(0);
         return null;
     }
 
-    // --- B2B PRICE LOGIC ---
     public String getWholesalePrice() {
         if (displayPrice != null && !displayPrice.isEmpty()) return displayPrice;
         if (localWholesalePrice != null && !localWholesalePrice.isEmpty()) return localWholesalePrice;

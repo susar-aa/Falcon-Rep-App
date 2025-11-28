@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android"
+    android:shape="rectangle">
+
+    <!-- Semi-transparent black by default (great for overlaying on images) -->
+    <!-- You can override this using app:backgroundTint in your layout -->
+    <solid android:color="#99000000"/>
+
+    <!-- Large radius to make it capsule/pill shaped -->
+    <corners android:radius="100dp"/>
+
+</shape>

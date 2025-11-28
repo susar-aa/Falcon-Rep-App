@@ -7,6 +7,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.Html;
+import android.util.Log;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
@@ -21,6 +22,7 @@ import androidx.recyclerview.widget.LinearLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.bumptech.glide.Glide;
+import com.bumptech.glide.load.engine.DiskCacheStrategy; // Import this
 import com.example.falconrep.models.Category;
 import com.example.falconrep.models.Product;
 
@@ -55,7 +57,6 @@ public class MainActivity extends AppCompatActivity {
 
         dbHelper = new DatabaseHelper(this);
 
-        // Check for incoming Category Filter
         selectedCategoryId = getIntent().getIntExtra("SELECTED_CAT_ID", 0);
 
         recyclerView = findViewById(R.id.recyclerView);
@@ -85,8 +86,6 @@ public class MainActivity extends AppCompatActivity {
         });
 
         loadCategories();
-
-        // Initial Search
         performSearch("");
     }
 
@@ -100,7 +99,6 @@ public class MainActivity extends AppCompatActivity {
                 categoryList.addAll(cats);
                 catAdapter.notifyDataSetChanged();
 
-                // Scroll to selected category if one was passed
                 if (selectedCategoryId > 0) {
                     for(int i=0; i<categoryList.size(); i++) {
                         if(categoryList.get(i).getId() == selectedCategoryId) {
@@ -146,6 +144,11 @@ public class MainActivity extends AppCompatActivity {
         new Thread(() -> {
             int loaded = dbHelper.getProductCount();
             int offlineReady = dbHelper.getOfflineReadyCount();
+
+            // LOGGING FOR DEBUGGING
+            Log.d("FalconStats", "Total Products: " + loaded);
+            Log.d("FalconStats", "Offline Ready: " + offlineReady);
+
             runOnUiThread(() -> {
                 txtLoadedCount.setText(String.valueOf(loaded));
                 txtOfflineCount.setText(String.valueOf(offlineReady));
@@ -153,7 +156,6 @@ public class MainActivity extends AppCompatActivity {
         }).start();
     }
 
-    // --- CATEGORY ADAPTER ---
     class CategoryAdapter extends RecyclerView.Adapter<CategoryAdapter.CatViewHolder> {
         private List<Category> list;
         public CategoryAdapter(List<Category> list) { this.list = list; }
@@ -193,7 +195,6 @@ public class MainActivity extends AppCompatActivity {
         }
     }
 
-    // --- PRODUCT ADAPTER (Same as before) ---
     class ProductAdapter extends RecyclerView.Adapter<ProductAdapter.ViewHolder> {
         private List<Product> list;
         public ProductAdapter(List<Product> list) { this.list = list; }
@@ -204,27 +205,34 @@ public class MainActivity extends AppCompatActivity {
         @Override public void onBindViewHolder(@NonNull ViewHolder holder, int position) {
             Product p = list.get(position);
             holder.name.setText(Html.fromHtml(p.getName(), Html.FROM_HTML_MODE_LEGACY));
-            holder.price.setText("Rs " + p.getWholesalePrice());
+
+            if (p.getDisplayPrice() != null && !p.getDisplayPrice().isEmpty()) {
+                holder.price.setText("Rs " + p.getDisplayPrice());
+            } else {
+                holder.price.setText("Rs " + p.getWholesalePrice());
+            }
 
             holder.itemView.setOnClickListener(v -> {
                 ProductDetailBottomSheet bottomSheet = ProductDetailBottomSheet.newInstance(p.getId());
                 bottomSheet.show(getSupportFragmentManager(), "ProductDetail");
             });
 
-            holder.itemView.setOnLongClickListener(v -> {
-                new AlertDialog.Builder(MainActivity.this)
-                        .setTitle("Debug Info")
-                        .setMessage("SKU: " + p.getSku() + "\nTokens: " + p.getCategoryTokens())
-                        .setPositiveButton("OK", null).show();
-                return true;
-            });
+            // --- IMPROVED IMAGE LOADING LOGIC ---
+            // 1. Try to get a Verified Local File (exists + size > 0)
+            File localFile = p.getValidLocalFile(MainActivity.this);
 
-            String localPath = p.getFirstImageLocalPath();
-            String webUrl = p.getFirstImageWebUrl();
-            if (localPath != null && new File(localPath).exists()) {
-                Glide.with(MainActivity.this).load(new File(localPath)).into(holder.image);
+            if (localFile != null) {
+                // Load local file
+                Glide.with(MainActivity.this)
+                        .load(localFile)
+                        .placeholder(android.R.drawable.ic_menu_gallery)
+                        .into(holder.image);
             } else {
-                Glide.with(MainActivity.this).load(webUrl)
+                // 2. Fallback to URL, but FORCE CACHING (DiskCacheStrategy.ALL)
+                // This ensures that if the user sees it once, it stays offline.
+                Glide.with(MainActivity.this)
+                        .load(p.getFirstImageWebUrl())
+                        .diskCacheStrategy(DiskCacheStrategy.ALL)
                         .placeholder(android.R.drawable.ic_menu_gallery)
                         .into(holder.image);
             }
